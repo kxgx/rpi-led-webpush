@@ -1,6 +1,6 @@
 # rpi-led-webpush — push video from a browser to a HUB75 LED matrix
 
-Open a web page on your phone or PC, pick a **video file**, your **camera**, or a **screen share**,
+[中文说明](README.zh-CN.md) · Open a web page on your phone or PC, pick a **video file**, your **camera**, or a **screen share**,
 and it plays on a HUB75 RGB LED matrix panel in real time.
 
 The heavy lifting happens **in the browser**: it decodes and scales the source to the panel's
