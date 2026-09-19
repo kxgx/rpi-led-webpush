@@ -1,0 +1,23 @@
+# HTTPS front-end for rpi-led-webpush.
+# Browsers only allow camera / screen capture from a secure context, so this lets a phone or PC
+# push those sources over https://<device>/ (accept the self-signed certificate once).
+#
+# Create a certificate first:
+#   sudo mkdir -p /etc/ssl/led
+#   sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+#        -keyout /etc/ssl/led/key.pem -out /etc/ssl/led/cert.pem \
+#        -subj "/CN=led-panel" -addext "subjectAltName=IP:<device-ip>"
+[Unit]
+Description=HTTPS front-end for rpi-led-webpush (socat TLS termination)
+After=network.target rpi-led-webpush.service
+Wants=rpi-led-webpush.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat OPENSSL-LISTEN:443,cert=/etc/ssl/led/cert.pem,key=/etc/ssl/led/key.pem,verify=0,reuseaddr,fork TCP:127.0.0.1:8080
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[package]
+name = "rpi-led-webpush"
+version = "0.1.0"
+edition = "2024"
+description = "Push video from a browser to a HUB75 LED matrix (zero third-party dependencies)"
+license = "GPL-2.0-or-later"
+
+# Intentionally empty: this program uses no crates.io dependencies at all.
+# The HTTP/WebSocket server, SHA-1 and base64 are implemented in src/web.rs; the panel is driven
+# through hand-written FFI declarations against rpi-rgb-led-matrix's C API.
+[dependencies]
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

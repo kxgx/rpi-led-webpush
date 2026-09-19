@@ -1,0 +1,17 @@
+[Unit]
+Description=Browser-driven video for a HUB75 LED matrix
+After=multi-user.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rpi-led-webpush
+ExecStart=/opt/rpi-led-webpush/rpi-led-webpush --mapping regular --rgb-sequence RGB --web-port 8080
+# needs /dev/mem and /dev/pio0
+User=root
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
