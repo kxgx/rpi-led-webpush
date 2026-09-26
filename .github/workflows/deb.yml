@@ -89,34 +89,11 @@ jobs:
           name: rpi-led-webpush-linux-arm64-deb
           path: dist/*.deb
 
-  deb-amd64:
-    name: Linux AMD64 deb
-    needs: [checks]
-    if: needs.checks.outputs.code == 'true' || startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v5
-      - name: 安装构建工具
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential dpkg-dev
-      - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: 构建 .deb
-        run: deploy/build-deb.sh dist
-      - name: 上传构件
-        uses: actions/upload-artifact@v6
-        with:
-          name: rpi-led-webpush-linux-amd64-deb
-          path: dist/*.deb
+  # 树莓派只需 ARM64；x86 包无硬件可跑，不在此矩阵中构建。
 
   release:
     name: 发布
-    needs: [deb-arm64, deb-amd64]
+    needs: [deb-arm64]
     # 仅官方仓库 tag 触发，防误发布（同 remilia_pet_qt）
     if: github.repository == 'kxgx/rpi-led-webpush' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
@@ -152,14 +129,14 @@ jobs:
 
   ci-passed:
     name: 构建门禁
-    needs: [checks, deb-arm64, deb-amd64]
+    needs: [checks, deb-arm64]
     if: always() && github.repository == 'kxgx/rpi-led-webpush'
     runs-on: ubuntu-latest
     steps:
       - name: 校验结果
         run: |
           FAIL=0
-          for r in ${{ needs.deb-arm64.result }} ${{ needs.deb-amd64.result }}; do
+          for r in ${{ needs.deb-arm64.result }}; do
             if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then FAIL=1; fi
           done
           cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY_EOF
@@ -169,7 +146,6 @@ jobs:
           |------|------|
           | 变更检测 | ${{ needs.checks.result }} |
           | ARM64 deb | ${{ needs.deb-arm64.result }} |
-          | AMD64 deb | ${{ needs.deb-amd64.result }} |
           SUMMARY_EOF
           if [ "$FAIL" = "1" ]; then echo "❌ 存在失败平台"; exit 1; fi
           echo "✅ 门禁通过"
