@@ -95,6 +95,9 @@ fi
 EOF
 chmod 755 "$STAGE/DEBIAN/postrm"
 
+# 用户配置升级时不覆盖
+echo /etc/rpi-led-webpush/config > "$STAGE/DEBIAN/conffiles"
+
 echo "==> dpkg-deb"
 DEB="$OUT/${PKG_NAME}_${VERSION}_${ARCH}.deb"
 dpkg-deb --build --root-owner-group "$STAGE" "$DEB"
