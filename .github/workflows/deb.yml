@@ -117,14 +117,22 @@ jobs:
       - name: 生成校验和与变更摘要
         run: |
           echo "Build: ${{ github.ref_name }}" > sums.txt
-          sha256sum rpi-led-webpush-*.deb >> sums.txt
+          # 包名形如 rpi-led-webpush_0.2.0_arm64.deb（下划线），不能用 rpi-led-webpush-*.deb
+          shopt -s nullglob
+          DEBS=(*.deb)
+          if [ ${#DEBS[@]} -eq 0 ]; then
+            echo "FAIL: no .deb artifacts downloaded"
+            ls -la
+            exit 1
+          fi
+          sha256sum "${DEBS[@]}" >> sums.txt
           CHANGES=$(git log --abbrev=8 --abbrev-commit --pretty=format:" - %s(%h) by %an" -15)
           { echo "## 最近变更:"; echo "$CHANGES"; } > changelog.txt
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            rpi-led-webpush-*.deb
+            *.deb
             sums.txt
             changelog.txt
           draft: false
