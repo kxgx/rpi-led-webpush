@@ -80,6 +80,7 @@ fn apply_cli(c: &mut config::Config) {
             "--help" | "-h" => {
                 println!("usage: rpi-led-webpush [options]");
                 println!("  panel:  --rows --cols --chain --parallel --brightness --no-idle");
+                println!("          --no-clock --clock-12h");
                 println!("  wiring: --mapping NAME --rgb-sequence RGB");
                 println!("  web:    --web-port 8080");
                 println!("  driver: --panel-type TYPE   (FM6126A / FM6127, empty = generic)");

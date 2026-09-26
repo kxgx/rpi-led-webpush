@@ -18,9 +18,9 @@ WebSocket 发过来，所以驱动面板的设备几乎不占 CPU。
 * **帧率跟随源** —— 由 `requestVideoFrameCallback` 驱动，60fps 的视频就发 60fps，
   10fps 就发 10fps，不是固定节流。
 * **背压丢帧** —— 链路跟不上时主动丢帧而不是堆积，慢网下是"降帧"而不是"延迟越滚越大"。
-* **桌面端可后台运行** —— 会申请屏幕常亮（Wake Lock），并有两层兜底（静音 AudioContext
-  节拍器 + 定时器）让最小化后仍持续发送。手机浏览器会挂起后台页面，这是平台限制，
-  网页无法绕过。
+* **桌面端可后台运行** —— 会申请屏幕常亮（Wake Lock），并用 Worker 定时器、静音音频节拍
+  和主线程定时器三层保活，标签页被限流时仍继续发送（约 20fps 封顶）。
+  手机浏览器会挂起后台页面，这是平台限制，网页无法绕过。
 
 ## 路由
 
@@ -28,13 +28,15 @@ WebSocket 发过来，所以驱动面板的设备几乎不占 CPU。
 |---|---|---|
 | `/` | GET | 投送页（内嵌）：视频文件 / 摄像头 / 共享屏幕，可选适应方式 |
 | `/view` | GET | 实时预览面板此刻显示的内容 |
-| `/settings` | GET | 设备设置页（面板尺寸、亮度、映射等） |
+| `/settings` | GET | 设备设置页（面板尺寸、亮度、驱动、语言等） |
 | `/geo` | GET | 面板逻辑分辨率，如 `64 32` |
 | `/api/config` | GET | 当前设置 + 运行时信息（JSON） |
 | `/api/config` | POST | 修改设置（`application/x-www-form-urlencoded`），自动存盘 |
+| `/api/brightness` | GET | 读取当前亮度 |
+| `/api/brightness` | POST | 设置亮度（`?brightness=1..100`），立即生效 |
 | `/api/restart` | POST | 干净退出，交给 supervisor 拉起（改几何后用） |
 | `/push` | WebSocket | 投送方向：二进制帧 `[宽 u16][高 u16][RGB…]`（小端） |
-| `/ws` | WebSocket | 预览方向：同样的帧格式，服务端 → 浏览器 |
+| `/ws` | WebSocket | 预览方向：在 RGB 前另有 `u32` 序号，供预览页 |
 
 ## 设置与持久化
 
@@ -42,10 +44,11 @@ WebSocket 发过来，所以驱动面板的设备几乎不占 CPU。
 
 * 路径：`LED_CONFIG` → `/etc/rpi-led-webpush/config` → `./rpi-led-webpush.conf`
 * CLI 参数**只覆盖当次运行**；网页修改的是配置文件。
-* **立即生效**：`brightness`、`idle`、`show_clock`、`clock_24h`。
+* **立即生效**：`brightness`、`idle`、`show_clock`、`clock_24h`、`lang`。
 * **需重启**（`POST /api/restart`）：尺寸 / 连接方式 / `web_port`，以及下列**硬件驱动**参数。
 
-无浏览器推流时面板默认显示**时钟 + 日期**（可用设置页关闭，退回空闲呼吸）。
+无浏览器推流时面板默认显示**时钟 + 日期**（`show_clock=1`，可配 `clock_24h`、`lang=zh|en`）。
+关掉时钟后回到空闲呼吸（`idle=1`）或黑屏（`idle=0`）。
 
 ### 硬件驱动参数
 
@@ -53,7 +56,7 @@ WebSocket 发过来，所以驱动面板的设备几乎不占 CPU。
 
 | 配置项 | CLI | 说明 |
 |---|---|---|
-| `panel_type` | `--panel-type` | `FM6126A` / `FM6127`（空 = 通用） |
+| `panel_type` | `--panel-type` / `--driver` | `FM6126A` / `FM6127`（空 = 通用） |
 | `gpio_slowdown` | `--gpio-slowdown` | 0..4，花屏时加大 |
 | `pwm_bits` | `--pwm-bits` | 1..11 |
 | `pwm_lsb_ns` | `--pwm-lsb-ns` | 纳秒 |
@@ -104,7 +107,9 @@ sudo ./rpi-led-webpush --web-port 0               # 关闭网页服务
 | `--mapping` | `regular` | GPIO 映射（`regular`、`adafruit-hat`、`adafruit-hat-pwm`、`classic` 等） |
 | `--rgb-sequence` | `RGB` | 面板的颜色通道顺序 |
 | `--web-port` | 8080 | `0` 表示关闭网页服务 |
-| `--no-idle` | — | 空闲时保持黑屏（默认是缓慢呼吸的暗蓝） |
+| `--no-idle` | — | 空闲时不显示呼吸灯（黑屏） |
+| `--no-clock` | — | 空闲时不显示时钟/日期 |
+| `--clock-12h` | — | 12 小时制（默认 24 小时制） |
 
 ## HTTPS（摄像头与屏幕共享需要）
 

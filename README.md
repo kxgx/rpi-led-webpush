@@ -22,13 +22,15 @@ device driving the panel stays almost idle.
 |---|---|---|
 | `/` | GET | sender page (embedded): video file / camera / screen share, fit modes |
 | `/view` | GET | live preview of what the panel is displaying right now |
-| `/settings` | GET | device settings page (panel size, brightness, mapping, …) |
+| `/settings` | GET | device settings page (panel size, brightness, driver, language, …) |
 | `/geo` | GET | logical resolution, e.g. `64 32` |
 | `/api/config` | GET | current settings + runtime info (JSON) |
 | `/api/config` | POST | update settings (`application/x-www-form-urlencoded`); persisted |
+| `/api/brightness` | GET | current brightness |
+| `/api/brightness` | POST | set brightness (`?brightness=1..100`); applied immediately |
 | `/api/restart` | POST | stop cleanly so the supervisor can restart (new geometry etc.) |
 | `/push` | WebSocket | sender → device: binary frames `[w u16][h u16][RGB…]` (little-endian) |
-| `/ws` | WebSocket | device → browser: the same frame format, for the preview |
+| `/ws` | WebSocket | device → browser: same RGB payload plus a `u32` sequence number, for the preview |
 
 ## Settings & persistence
 
@@ -36,9 +38,13 @@ Settings live in a plain `key=value` file (no format library):
 
 * `LED_CONFIG` if set, else `/etc/rpi-led-webpush/config`, else `./rpi-led-webpush.conf`
 * CLI flags override the file **for that run only**; the web UI edits the file.
-* **Hot-applied** (no restart): `brightness`, `idle`.
+* **Hot-applied** (no restart): `brightness`, `idle`, `show_clock`, `clock_24h`, `lang`.
 * **Need restart** (`POST /api/restart`): geometry (`rows`/`cols`/`chain`/`parallel`),
   wiring (`mapping`/`rgb_sequence`), `web_port`, and all **hardware driver** options below.
+
+While nothing is streaming the panel shows a **clock + date** by default (`show_clock=1`,
+`clock_24h`, `lang=zh|en` weekday). Turn the clock off to fall back to the dim-blue idle
+breathing (`idle=1`) or a dark panel (`idle=0`).
 
 ### Hardware driver options
 
@@ -47,7 +53,7 @@ at panel bring-up:
 
 | Key | CLI | Notes |
 |---|---|---|
-| `panel_type` | `--panel-type` | `FM6126A` / `FM6127` (empty = generic) |
+| `panel_type` | `--panel-type` / `--driver` | `FM6126A` / `FM6127` (empty = generic) |
 | `gpio_slowdown` | `--gpio-slowdown` | 0..4 |
 | `pwm_bits` | `--pwm-bits` | 1..11 |
 | `pwm_lsb_ns` | `--pwm-lsb-ns` | nanoseconds |
@@ -72,12 +78,11 @@ web-saved config is what restarts with.
 * **Back-pressure.** If the link cannot keep up, frames are dropped instead of queued, so a slow
   network degrades gracefully instead of building up latency. The page shows `src → sent` rates and
   a dropped-frame counter.
-* **Runs in the background (desktop).** A screen Wake Lock is requested to prevent the display from
-  sleeping, and two fallbacks (a silent `AudioContext` ticker and a timer) keep frames flowing when
-  the browser deprioritises a minimised tab. Mobile browsers suspend background pages entirely —
-  that is a platform limit, not something a web page can work around.
-* **Idle state.** While nothing is being pushed, the panel shows a slow dim-blue breathing pattern
-  (disable with `--no-idle`).
+* **Runs in the background (desktop).** A screen Wake Lock keeps the display awake, and three
+  keep-alives (Worker timer, silent AudioContext ticker, and a main-thread timer) keep sending
+  when the tab is throttled (capped at ~20 fps). Mobile browsers suspend background pages
+  entirely — that is a platform limit, not something a web page can work around.
+* **Idle state.** Clock + date by default; optional dim-blue breathing or black.
 
 ## Requirements
 
@@ -112,7 +117,9 @@ Run it as root: it needs `/dev/mem` and `/dev/pio0`.
 | `--mapping` | `regular` | GPIO mapping (`regular`, `adafruit-hat`, `adafruit-hat-pwm`, `classic`, …) |
 | `--rgb-sequence` | `RGB` | channel order of your panel |
 | `--web-port` | 8080 | `0` disables the web UI |
-| `--no-idle` | — | keep the panel dark while idle |
+| `--no-idle` | — | keep the panel dark while idle (no breathing) |
+| `--no-clock` | — | do not show clock/date while idle |
+| `--clock-12h` | — | 12-hour clock instead of 24-hour |
 
 ## HTTPS (needed for camera and screen capture)
 
