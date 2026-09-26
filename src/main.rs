@@ -21,6 +21,7 @@
 //! Settings persist to a `key=value` file (see `config.rs`). CLI flags override the file
 //! for the current run; the web UI writes the file and applies hot settings immediately.
 
+mod clock;
 mod config;
 mod ffi;
 mod web;
@@ -59,6 +60,8 @@ fn apply_cli(c: &mut config::Config) {
             "--mapping" => if let Some(v) = take_value(&argv, &mut i) { c.mapping = v },
             "--rgb-sequence" => if let Some(v) = take_value(&argv, &mut i) { c.rgb_sequence = v },
             "--no-idle" => c.idle = false,
+            "--no-clock" => c.show_clock = false,
+            "--clock-12h" => c.clock_24h = false,
             // 硬件驱动
             "--panel-type" | "--driver" => if let Some(v) = take_value(&argv, &mut i) { c.panel_type = v },
             "--gpio-slowdown" => if let Some(v) = take_value(&argv, &mut i) { c.gpio_slowdown = v.parse().unwrap_or(c.gpio_slowdown) },
@@ -253,6 +256,9 @@ fn main() {
     let mirror = web::new_mirror(lw as usize, lh as usize);
     let stream = web::new_stream();
     let ctl = web::new_runtime(args.brightness, args.idle);
+    ctl.show_clock.store(args.show_clock, Ordering::SeqCst);
+    ctl.clock_24h.store(args.clock_24h, Ordering::SeqCst);
+    ctl.lang_en.store(args.lang == "en", Ordering::SeqCst);
     if args.web_port > 0 {
         web::spawn_web_server(
             args.web_port,
@@ -278,6 +284,7 @@ fn main() {
     let mut phase: f32 = 0.0;
     let mut was_streaming = false;
     let mut last_brightness = args.brightness;
+    let mut clock_buf: Vec<ffi::Color> = vec![ffi::Color::default(); (lw * lh) as usize];
     while !STOP.load(Ordering::SeqCst) {
         if ctl.restart.load(Ordering::SeqCst) {
             println!("restart requested from web UI");
@@ -311,8 +318,33 @@ fn main() {
             was_streaming = false;
             println!("stream stopped");
         }
-        // idle: a slow dim-blue breathing so it is obvious the program is alive
-        if ctl.idle.load(Ordering::SeqCst) {
+        // idle：默认时钟/日期；可关掉后退回呼吸或黑屏
+        if ctl.show_clock.load(Ordering::SeqCst) {
+            let t = clock::now_local();
+            let use24h = ctl.clock_24h.load(Ordering::SeqCst);
+            let lang = if ctl.lang_en.load(Ordering::SeqCst) { "en" } else { "zh" };
+            if clock_buf.len() != (lw * lh) as usize {
+                clock_buf = vec![ffi::Color::default(); (lw * lh) as usize];
+            }
+            clock::draw_clock(&mut clock_buf, lw as usize, lh as usize, &t, use24h, lang);
+            clock::blit(canvas, lw, lh, &clock_buf);
+            canvas = unsafe { ffi::led_matrix_swap_on_vsync(matrix, canvas) };
+            if let Ok(mut m) = mirror.lock() {
+                if m.w != lw as usize || m.h != lh as usize || m.rgb.len() != (lw * lh * 3) as usize {
+                    m.w = lw as usize;
+                    m.h = lh as usize;
+                    m.rgb.resize((lw * lh * 3) as usize, 0);
+                }
+                for (i, px) in clock_buf.iter().enumerate() {
+                    let o = i * 3;
+                    m.rgb[o] = px.r;
+                    m.rgb[o + 1] = px.g;
+                    m.rgb[o + 2] = px.b;
+                }
+                m.seq += 1;
+                m.page = "clock".to_string();
+            }
+        } else if ctl.idle.load(Ordering::SeqCst) {
             phase = (phase + 0.04) % std::f32::consts::TAU;
             let v = (6.0 + 6.0 * (phase.sin() + 1.0)) as u8;
             unsafe { ffi::led_canvas_fill(canvas, 0, 0, v) };
@@ -333,7 +365,7 @@ fn main() {
                 m.page.clear();
             }
         } else {
-            // 空闲且关闭了呼吸：保持黑屏，但仍刷新 mirror 以免预览漂在旧帧上
+            // 空闲且关闭了呼吸/时钟：保持黑屏，但仍刷新 mirror 以免预览漂在旧帧上
             unsafe { ffi::led_canvas_fill(canvas, 0, 0, 0) };
             canvas = unsafe { ffi::led_matrix_swap_on_vsync(matrix, canvas) };
         }

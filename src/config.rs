@@ -20,6 +20,12 @@ pub struct Config {
     pub rgb_sequence: String,
     pub web_port: u16,
     pub idle: bool,
+    /// 无投送时显示时钟/日期（默认开）
+    pub show_clock: bool,
+    /// 时钟用 24 小时制（否则 12 小时制）
+    pub clock_24h: bool,
+    /// 界面与星期语言："zh" / "en"
+    pub lang: String,
     // ---- 硬件驱动（rpi-rgb-led-matrix 初始化参数）----
     /// 驱动芯片 / 面板类型：空 = 通用；FM6126A / FM6127 需要上电初始化序列
     pub panel_type: String,
@@ -63,6 +69,9 @@ impl Default for Config {
             rgb_sequence: "RGB".to_string(),
             web_port: 8080,
             idle: true,
+            show_clock: true,
+            clock_24h: true,
+            lang: "zh".to_string(),
             panel_type: String::new(),
             gpio_slowdown: 1,
             pwm_bits: 11,
@@ -101,6 +110,14 @@ impl Config {
             "rgb_sequence" => self.rgb_sequence = v.to_string(),
             "web_port" => self.web_port = v.parse().unwrap_or(self.web_port),
             "idle" => self.idle = matches!(v, "1" | "true" | "yes" | "on"),
+            "show_clock" => self.show_clock = matches!(v, "1" | "true" | "yes" | "on"),
+            "clock_24h" => self.clock_24h = matches!(v, "1" | "true" | "yes" | "on"),
+            "lang" => {
+                self.lang = match v.to_ascii_lowercase().as_str() {
+                    "en" | "english" => "en".to_string(),
+                    _ => "zh".to_string(),
+                }
+            }
             // 硬件驱动
             "panel_type" | "driver" => self.panel_type = v.to_string(),
             "gpio_slowdown" => self.gpio_slowdown = v.parse().unwrap_or(self.gpio_slowdown),
@@ -145,6 +162,9 @@ impl Config {
         self.multiplexing = self.multiplexing.clamp(0, 16);
         self.limit_refresh_hz = self.limit_refresh_hz.clamp(0, 240);
         self.rp1_pio = if self.rp1_pio != 0 { 1 } else { 0 };
+        if self.lang != "en" {
+            self.lang = "zh".to_string();
+        }
         // panel_type 统一成库认识的大小写风格
         self.panel_type = match self.panel_type.trim().to_ascii_lowercase().as_str() {
             "" => String::new(),
@@ -259,6 +279,8 @@ fn write_config(path: &Path, c: &Config) -> std::io::Result<()> {
          rows={}\ncols={}\nchain={}\nparallel={}\n\
          brightness={}\nmapping={}\nrgb_sequence={}\n\
          web_port={}\nidle={}\n\
+         show_clock={}\nclock_24h={}\n\
+         lang={}\n\
          \n# ---- hardware driver ----\n\
          panel_type={}\n\
          gpio_slowdown={}\n\
@@ -283,6 +305,9 @@ fn write_config(path: &Path, c: &Config) -> std::io::Result<()> {
         c.rgb_sequence,
         c.web_port,
         if c.idle { 1 } else { 0 },
+        if c.show_clock { 1 } else { 0 },
+        if c.clock_24h { 1 } else { 0 },
+        c.lang,
         c.panel_type,
         c.gpio_slowdown,
         c.pwm_bits,

@@ -103,3 +103,58 @@ pub unsafe fn register_signal(signum: c_int, handler: extern "C" fn(c_int)) {
     unsafe { signal(signum, handler) };
 }
 
+// ---- libc time（只声明 localtime_r / time，不引入 libc crate）----
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CTm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    tm_gmtoff: i64,
+    tm_zone: *const c_char,
+}
+
+unsafe extern "C" {
+    fn time(t: *mut i64) -> i64;
+    fn localtime_r(t: *const i64, tm: *mut CTm) -> *mut CTm;
+}
+
+/// 本地时间（解析 /etc/localtime 与 TZ）。
+pub fn local_time() -> Option<crate::clock::LocalTime> {
+    let mut secs: i64 = 0;
+    let mut tm = CTm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 1,
+        tm_mon: 0,
+        tm_year: 70,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null(),
+    };
+    unsafe {
+        time(&mut secs);
+        if localtime_r(&secs, &mut tm).is_null() {
+            return None;
+        }
+    }
+    Some(crate::clock::LocalTime {
+        hour: tm.tm_hour.clamp(0, 23) as u32,
+        min: tm.tm_min.clamp(0, 59) as u32,
+        sec: tm.tm_sec.clamp(0, 60) as u32,
+        mday: tm.tm_mday.clamp(1, 31) as u32,
+        mon: (tm.tm_mon + 1).clamp(1, 12) as u32,
+        wday: tm.tm_wday.rem_euclid(7) as u32,
+    })
+}
+

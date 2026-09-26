@@ -44,6 +44,12 @@ pub struct RuntimeCtl {
     pub brightness: AtomicI32,
     pub idle: AtomicBool,
     pub restart: AtomicBool,
+    /// 无投送时显示时钟
+    pub show_clock: AtomicBool,
+    /// 时钟 24 小时制
+    pub clock_24h: AtomicBool,
+    /// 界面语言：0=zh，1=en
+    pub lang_en: AtomicBool,
 }
 
 pub type SharedRuntime = Arc<RuntimeCtl>;
@@ -53,6 +59,9 @@ pub fn new_runtime(brightness: i32, idle: bool) -> SharedRuntime {
         brightness: AtomicI32::new(brightness),
         idle: AtomicBool::new(idle),
         restart: AtomicBool::new(false),
+        show_clock: AtomicBool::new(true),
+        clock_24h: AtomicBool::new(true),
+        lang_en: AtomicBool::new(false),
     })
 }
 
@@ -182,10 +191,19 @@ fn handle_client(mut s: TcpStream, mirror: SharedMirror, stream: SharedStream,
                 api_brightness_set(&mut s, &cfg, &rt, &query, &body)
             }
         }
-        "/settings" => write_http(&mut s, "200 OK", "text/html; charset=utf-8", SETTINGS_HTML.as_bytes()),
-        "/view" => write_http(&mut s, "200 OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
-        _ => write_http(&mut s, "200 OK", "text/html; charset=utf-8", SENDER_HTML.as_bytes()),
+        "/settings" => write_http(&mut s, "200 OK", "text/html; charset=utf-8",
+                                  html_lang(SETTINGS_HTML, &rt).as_bytes()),
+        "/view" => write_http(&mut s, "200 OK", "text/html; charset=utf-8",
+                              html_lang(INDEX_HTML, &rt).as_bytes()),
+        _ => write_http(&mut s, "200 OK", "text/html; charset=utf-8",
+                        html_lang(SENDER_HTML, &rt).as_bytes()),
     }
+}
+
+/// 把页面里的 __LANG__ 换成 zh/en（全局中英切换）。
+fn html_lang(html: &str, rt: &SharedRuntime) -> String {
+    let lang = if rt.lang_en.load(Ordering::Relaxed) { "en" } else { "zh" };
+    html.replace("__LANG__", lang)
 }
 
 #[cfg(test)]
@@ -370,6 +388,7 @@ fn config_json(cfg: &SharedConfig, rt: &SharedRuntime, stream: &SharedStream,
         r#"{{"settings":{{"rows":{rows},"cols":{cols},"chain":{chain},"parallel":{parallel},
         "brightness":{brightness},"mapping":"{mapping}","rgb_sequence":"{rgb_sequence}",
         "web_port":{web_port},"idle":{idle},
+        "show_clock":{show_clock},"clock_24h":{clock_24h},"lang":"{lang}",
         "panel_type":"{panel_type}","gpio_slowdown":{gpio_slowdown},
         "pwm_bits":{pwm_bits},"pwm_lsb_ns":{pwm_lsb_ns},"pwm_dither":{pwm_dither},
         "scan_mode":{scan_mode},"row_address_type":{row_addr},"multiplexing":{mux},
@@ -387,6 +406,9 @@ fn config_json(cfg: &SharedConfig, rt: &SharedRuntime, stream: &SharedStream,
         rgb_sequence = json_escape(&c.rgb_sequence),
         web_port = c.web_port,
         idle = c.idle,
+        show_clock = c.show_clock,
+        clock_24h = c.clock_24h,
+        lang = json_escape(&c.lang),
         panel_type = json_escape(&c.panel_type),
         gpio_slowdown = c.gpio_slowdown,
         pwm_bits = c.pwm_bits,
@@ -457,6 +479,14 @@ fn api_config_set(s: &mut TcpStream, cfg: &SharedConfig, rt: &SharedRuntime,
             "rgb_sequence" => if !v.is_empty() { c.rgb_sequence = v },
             "web_port" => if let Ok(n) = v.parse() { c.web_port = n },
             "idle" => c.idle = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+            "show_clock" => c.show_clock = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+            "clock_24h" => c.clock_24h = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+            "lang" => {
+                c.lang = match v.to_ascii_lowercase().as_str() {
+                    "en" | "english" => "en".to_string(),
+                    _ => "zh".to_string(),
+                }
+            }
             // 硬件驱动
             "panel_type" | "driver" => c.panel_type = v,
             "gpio_slowdown" => if let Ok(n) = v.parse() { c.gpio_slowdown = n },
@@ -492,12 +522,18 @@ fn api_config_set(s: &mut TcpStream, cfg: &SharedConfig, rt: &SharedRuntime,
             // 运行时可热更的字段仍然立刻生效
             rt.brightness.store(c.brightness, Ordering::SeqCst);
             rt.idle.store(c.idle, Ordering::SeqCst);
+            rt.show_clock.store(c.show_clock, Ordering::SeqCst);
+            rt.clock_24h.store(c.clock_24h, Ordering::SeqCst);
+            rt.lang_en.store(c.lang == "en", Ordering::SeqCst);
             write_http(s, "200 OK", "application/json; charset=utf-8",
                        r#"{"ok":true,"restart_required":true,"hint":"hardware/geometry settings changed — POST /api/restart"}"#.as_bytes())
         }
         ApplyOutcome::Applied => {
             rt.brightness.store(c.brightness, Ordering::SeqCst);
             rt.idle.store(c.idle, Ordering::SeqCst);
+            rt.show_clock.store(c.show_clock, Ordering::SeqCst);
+            rt.clock_24h.store(c.clock_24h, Ordering::SeqCst);
+            rt.lang_en.store(c.lang == "en", Ordering::SeqCst);
             write_http(s, "200 OK", "application/json; charset=utf-8",
                        br#"{"ok":true,"restart_required":false}"#)
         }
@@ -808,11 +844,11 @@ fn base64(data: &[u8]) -> String {
 // ---------------------------------------------------------------- 内嵌前端页面
 
 const SETTINGS_HTML: &str = r#"<!doctype html>
-<html lang="zh-CN">
+<html lang="__LANG__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>LED 面板设置</title>
+<title data-en="LED panel settings">LED 面板设置</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -860,16 +896,16 @@ const SETTINGS_HTML: &str = r#"<!doctype html>
 <body>
 <div class="wrap">
   <header>
-    <h1>LED 面板设置<span class="sub">rpi-led-webpush</span></h1>
+    <h1><span data-en="LED panel settings">LED 面板设置</span><span class="sub">rpi-led-webpush</span></h1>
     <nav>
-      <a href="/">投送</a>
-      <a href="/view">预览</a>
-      <a href="/settings">设置</a>
+      <a href="/" data-en="Send">投送</a>
+      <a href="/view" data-en="Preview">预览</a>
+      <a href="/settings" data-en="Settings">设置</a>
     </nav>
   </header>
 
   <section>
-    <h2>面板</h2>
+    <h2 data-en="Panel">面板</h2>
     <div class="grid">
       <label>行 rows<span class="tag">面板高度 / 1 块</span>
         <input id="rows" type="number" min="1" max="512"></label>
@@ -879,18 +915,29 @@ const SETTINGS_HTML: &str = r#"<!doctype html>
         <input id="chain" type="number" min="1" max="32"></label>
       <label>并联 parallel<span class="tag">上下拼接</span>
         <input id="parallel" type="number" min="1" max="8"></label>
-      <label>亮度 %<span class="tag">拖动即时生效</span>
+      <label>亮度 %<span class="tag" data-en="applies live">拖动即时生效</span>
         <input id="brightness" type="range" min="1" max="100" step="1" style="padding:0">
         <div style="display:flex;justify-content:space-between;font-size:11px;color:#6e7681">
           <span>1</span><span id="brightness_val">—</span><span>100</span>
         </div>
       </label>
-      <label class="check"><input id="idle" type="checkbox"> 空闲呼吸</label>
+      <label class="check"><input id="idle" type="checkbox"> <span data-en="Idle breathing">空闲呼吸</span></label>
+      <label class="check"><input id="show_clock" type="checkbox"> <span data-en="Clock when idle">无投送时显示时钟</span></label>
+      <label class="check"><input id="clock_24h" type="checkbox"> <span data-en="24-hour clock">24 小时制</span></label>
+      <label>语言 Language
+        <select id="lang">
+          <option value="zh">中文</option>
+          <option value="en">English</option>
+        </select></label>
+    </div>
+    <div class="hint" style="color:#6e7681;font-size:12px;margin-top:8px"
+         data-en="Clock shows on the panel while nothing is streaming. Turn off to fall back to idle breathing.">
+      时钟在没有浏览器推流时显示于面板；关闭后回到空闲呼吸（或黑屏）。
     </div>
   </section>
 
   <section>
-    <h2>硬件</h2>
+    <h2 data-en="Hardware">硬件</h2>
     <div class="grid">
       <label>GPIO 映射 mapping
         <select id="mapping">
@@ -909,7 +956,7 @@ const SETTINGS_HTML: &str = r#"<!doctype html>
   </section>
 
   <section>
-    <h2>驱动芯片 / 初始化</h2>
+    <h2 data-en="Driver / init">驱动芯片 / 初始化</h2>
     <div class="grid">
       <label>面板类型 panel-type<span class="tag">特殊 IC 需要上电序列</span>
         <select id="panel_type">
@@ -953,25 +1000,29 @@ const SETTINGS_HTML: &str = r#"<!doctype html>
   </section>
 
   <section>
-    <h2>状态</h2>
+    <h2 data-en="Status">状态</h2>
     <div class="meta" id="meta">加载中…</div>
   </section>
 
   <div class="row">
-    <button class="primary" id="save">保存设置</button>
-    <button id="reload">重新读取</button>
-    <button class="danger" id="restart">重启设备</button>
+    <button class="primary" id="save" data-en="Save">保存设置</button>
+    <button id="reload" data-en="Reload">重新读取</button>
+    <button class="danger" id="restart" data-en="Restart device">重启设备</button>
     <span class="status" id="st"></span>
   </div>
 </div>
 <script>
+const L = '__LANG__';
 const $ = (id) => document.getElementById(id);
+if (L === 'en') {
+  document.querySelectorAll('[data-en]').forEach(el => { el.textContent = el.getAttribute('data-en'); });
+}
 const FIELDS = [
-  'rows','cols','chain','parallel','brightness','mapping','rgb_sequence','web_port',
+  'rows','cols','chain','parallel','brightness','mapping','rgb_sequence','web_port','lang',
   'panel_type','gpio_slowdown','pwm_bits','pwm_lsb_ns','pwm_dither','scan_mode',
   'row_address_type','multiplexing','limit_refresh_hz','rp1_pio','pixel_mapper'
 ];
-const CHECKS = ['idle','no_hardware_pulse','inverse_colors','no_busy_waiting'];
+const CHECKS = ['idle','show_clock','clock_24h','no_hardware_pulse','inverse_colors','no_busy_waiting'];
 
 function setStatus(msg, cls) {
   const el = $('st');
@@ -1047,18 +1098,24 @@ async function save() {
     });
     const j = await r.json();
     if (j.restart_required) {
-      setStatus('已保存。硬件/几何参数已改，需重启设备生效。', 'warn');
+      setStatus(L==='en' ? 'Saved. Hardware/geometry changed — restart the device.'
+                         : '已保存。硬件/几何参数已改，需重启设备生效。', 'warn');
     } else {
-      setStatus('已保存并生效。', 'ok');
+      setStatus(L==='en' ? 'Saved and applied.' : '已保存并生效。', 'ok');
     }
-    load();
+    // 语言变更后刷新，让 data-en 立即套用
+    if (L !== $('lang').value) {
+      setTimeout(() => location.reload(), 400);
+    } else {
+      load();
+    }
   } catch (e) {
-    setStatus('保存失败：' + e, 'err');
+    setStatus((L==='en'?'Save failed: ':'保存失败：') + e, 'err');
   }
 }
 
 async function restart() {
-  if (!confirm('确认重启 rpi-led-webpush？推流会中断。')) return;
+  if (!confirm(L==='en' ? 'Restart rpi-led-webpush? Streaming will drop.' : '确认重启 rpi-led-webpush？推流会中断。')) return;
   try {
     await fetch('/api/restart', { method: 'POST' });
     setStatus('已请求重启，稍候…', 'warn');
@@ -1078,11 +1135,11 @@ load();
 "#;
 
 const INDEX_HTML: &str = r#"<!doctype html>
-<html lang="zh-CN">
+<html lang="__LANG__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>LED 面板实时预览</title>
+<title data-en="LED panel preview">LED 面板实时预览</title>
 <style>
   :root { color-scheme: dark; --ar: 2; }
   * { box-sizing: border-box; }
@@ -1114,16 +1171,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <span id="pg"></span>
     <span id="fps">—</span>
     <label style="color:#6e7681;font-size:12px;display:flex;align-items:center;gap:6px">
-      亮度
+      <span data-en="Bright">亮度</span>
       <input id="bright" type="range" min="1" max="100" value="60" style="width:110px;vertical-align:middle">
       <span id="bright_v">60%</span>
     </label>
-    <button id="fs">全屏</button>
-    <a href="/settings" style="color:#58a6ff;text-decoration:none;margin-left:8px">设置</a>
-    <a href="/" style="color:#58a6ff;text-decoration:none;margin-left:12px">投送</a>
+    <button id="fs" data-en="Fullscreen">全屏</button>
+    <a href="/settings" style="color:#58a6ff;text-decoration:none;margin-left:8px" data-en="Settings">设置</a>
+    <a href="/" style="color:#58a6ff;text-decoration:none;margin-left:12px" data-en="Send">投送</a>
   </div>
-  <div class="hint">画面即 LED 面板正在显示的内容，随窗口自适应缩放</div>
+  <div class="hint" data-en="What you see is what the panel is showing right now">画面即 LED 面板正在显示的内容，随窗口自适应缩放</div>
 <script>
+const L = '__LANG__';
+if (L === 'en') {
+  document.documentElement.lang = 'en';
+  document.querySelectorAll('[data-en]').forEach(el => { el.textContent = el.getAttribute('data-en'); });
+}
 const c = document.getElementById('c');
 const ctx = c.getContext('2d', { alpha: false });
 let img = null, frames = 0, t0 = performance.now(), skipped = 0;
@@ -1208,11 +1270,11 @@ fetch('/api/brightness').then(r => r.json()).then(j => {
 // ---------------------------------------------------------------- 投送页（浏览器 → 面板）
 
 const SENDER_HTML: &str = r#"<!doctype html>
-<html lang="zh-CN">
+<html lang="__LANG__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>投送视频到 LED 面板</title>
+<title data-en="Send video to LED panel">投送视频到 LED 面板</title>
 <style>
   :root { color-scheme: dark; --ar: 2; }
   * { box-sizing: border-box; }
@@ -1243,12 +1305,12 @@ const SENDER_HTML: &str = r#"<!doctype html>
     <span id="geo">—</span>
     <span id="fps">—</span>
     <label style="color:#6e7681;font-size:12px;display:flex;align-items:center;gap:6px">
-      亮度
+      <span data-en="Bright">亮度</span>
       <input id="bright" type="range" min="1" max="100" value="60" style="width:110px">
       <span id="bright_v">60%</span>
     </label>
-    <a href="/view" style="color:#58a6ff;text-decoration:none">预览</a>
-    <a href="/settings" style="color:#58a6ff;text-decoration:none">设置</a>
+    <a href="/view" style="color:#58a6ff;text-decoration:none" data-en="Preview">预览</a>
+    <a href="/settings" style="color:#58a6ff;text-decoration:none" data-en="Settings">设置</a>
   </div>
   <div class="row">
     <label class="btn">选择视频文件<input type="file" id="file" accept="video/*"></label>
@@ -1261,12 +1323,18 @@ const SENDER_HTML: &str = r#"<!doctype html>
     </select>
     <button id="play">暂停</button>
   </div>
-  <div class="hint">投送期间会申请「屏幕常亮」以免息屏中断。切入后台后 rVFC/定时器会被浏览器限流，<br>
+  <div class="hint" data-en="While streaming we request a screen Wake Lock. In a background tab rVFC/timers are throttled, so a Worker + silent-audio ticker keeps sending (capped ~20fps). Keep the tab visible if it still stutters.<br>Preview is the panel's logical resolution and follows chained/parallel layout. Decode and scale all happen in your browser.">
+    投送期间会申请「屏幕常亮」以免息屏中断。切入后台后 rVFC/定时器会被浏览器限流，<br>
     本页用 Worker + 静音音频节拍继续抓帧发送（约 20fps 封顶）；若仍不流畅，请保持页面在前台。<br>
     预览即面板上正在显示的画面（画布就是面板的逻辑分辨率，随链屏/并联屏自动变化）。
     解码和缩放都在你的浏览器里完成，树莓派只接收小尺寸帧，CPU 占用极低。</div>
   <video id="v" muted loop playsinline></video>
 <script>
+const L = '__LANG__';
+if (L === 'en') {
+  document.documentElement.lang = 'en';
+  document.querySelectorAll('[data-en]').forEach(el => { el.textContent = el.getAttribute('data-en'); });
+}
 const cv = document.getElementById('cv');
 const v = document.getElementById('v');
 let ctx = null, geo = { w: 64, h: 32 }, ws = null;

@@ -41,8 +41,10 @@ WebSocket 发过来，所以驱动面板的设备几乎不占 CPU。
 
 * 路径：`LED_CONFIG` → `/etc/rpi-led-webpush/config` → `./rpi-led-webpush.conf`
 * CLI 参数**只覆盖当次运行**；网页修改的是配置文件。
-* **立即生效**：`brightness`、`idle`。
+* **立即生效**：`brightness`、`idle`、`show_clock`、`clock_24h`。
 * **需重启**（`POST /api/restart`）：尺寸 / 连接方式 / `web_port`，以及下列**硬件驱动**参数。
+
+无浏览器推流时面板默认显示**时钟 + 日期**（可用设置页关闭，退回空闲呼吸）。
 
 ### 硬件驱动参数
 

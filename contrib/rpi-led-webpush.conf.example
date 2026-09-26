@@ -22,6 +22,13 @@ web_port=8080
 # 1 = dim blue breathing while idle (hot-applied)
 idle=1
 
+# 1 = show clock/date on the panel while nothing is being pushed (default)
+show_clock=1
+# 1 = 24-hour clock, 0 = 12-hour
+clock_24h=1
+# UI + weekday language: zh or en
+lang=zh
+
 # ---- hardware driver ----
 # Special panel ICs that need a power-on init sequence (empty = generic)
 # panel_type=FM6126A
