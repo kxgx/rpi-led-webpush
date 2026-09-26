@@ -1,6 +1,6 @@
 [package]
 name = "rpi-led-webpush"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Push video from a browser to a HUB75 LED matrix (zero third-party dependencies)"
 license = "GPL-2.0-or-later"
