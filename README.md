@@ -8,11 +8,11 @@ logical resolution and sends only tiny frames (6 KB each for 64×32) over a WebS
 device driving the panel stays almost idle.
 
 * **Zero third-party dependencies** — `cargo tree` shows only this package. The HTTP server,
-  WebSocket framing, SHA-1 and base64 are implemented in `src/web.rs`; the panel is driven through
-  hand-written FFI declarations against
-  [rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix)'s C API. Nothing comes from
-  crates.io, so `cargo build --offline` works and there is no supply-chain surface.
-* **Self-contained front-end** — the sender and preview pages are embedded in the binary.
+  WebSocket framing, SHA-1 and base64 are implemented in `src/web.rs`. The HUB75 driver
+  ([rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix), GPL-2.0) is vendored
+  under `third_party/` and compiled by `build.rs`, so a plain `cargo build` is enough —
+  no `RGB_MATRIX_DIR`, no preinstalled `librgbmatrix`.
+* **Self-contained front-end** — the sender, preview and settings pages are embedded in the binary.
 * **Adapts to the panel** — the page reads the logical resolution from the device (`/geo`), so
   chained and parallel panels are handled without touching the front-end.
 
@@ -82,14 +82,13 @@ web-saved config is what restarts with.
 ## Requirements
 
 * A Raspberry Pi with a HUB75 panel (on Pi 5 the program selects the RP1 PIO backend itself)
-* [rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix), built (`make -C lib`)
+* A C/C++ toolchain (`g++`/`gcc`/`ar`) — used by `build.rs` to compile the vendored driver
 * Rust toolchain (edition 2024)
 
 ## Build
 
 ```bash
-# point at your rpi-rgb-led-matrix checkout / install prefix (default: /usr/local)
-RGB_MATRIX_DIR=/path/to/rpi-rgb-led-matrix cargo build --release --offline
+cargo build --release
 ```
 
 ## Run

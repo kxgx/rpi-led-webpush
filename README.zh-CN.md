@@ -9,10 +9,11 @@ WebSocket 发过来，所以驱动面板的设备几乎不占 CPU。
 ## 特点
 
 * **零第三方依赖** —— `cargo tree` 只有本包自身。HTTP 服务、WebSocket 帧、SHA-1、base64
-  都是手写的（见 `src/web.rs`），面板通过手写的 FFI 调用
-  [rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix) 的 C API。
-  不引入任何 crates.io 依赖，因此可 `cargo build --offline` 离线构建，也没有供应链投毒面。
-* **前端内嵌在二进制里** —— 投送页与预览页都在程序内部，无外部文件。
+  都是手写的（见 `src/web.rs`）。HUB75 驱动
+  [rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix)（GPL-2.0）已**内置**
+  在 `third_party/`，由 `build.rs` 自动编译，`cargo build` 即可，无需安装库、无需
+  `RGB_MATRIX_DIR`。
+* **前端内嵌在二进制里** —— 投送页、预览页与设置页都在程序内部，无外部文件。
 * **自适应面板** —— 页面从 `/geo` 读取面板的逻辑分辨率，链屏/并联屏无需改动前端。
 * **帧率跟随源** —— 由 `requestVideoFrameCallback` 驱动，60fps 的视频就发 60fps，
   10fps 就发 10fps，不是固定节流。
@@ -73,14 +74,13 @@ WebSocket 发过来，所以驱动面板的设备几乎不占 CPU。
 ## 依赖
 
 * 树莓派 + HUB75 面板（Pi 5 上程序自动选择 RP1 PIO 后端）
-* [rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix)，需先编译（`make -C lib`）
+* C/C++ 工具链（`g++`/`gcc`/`ar`），供 `build.rs` 编译内置驱动
 * Rust 工具链（edition 2024）
 
 ## 编译
 
 ```bash
-# 指向你的 rpi-rgb-led-matrix 目录或安装前缀（默认 /usr/local）
-RGB_MATRIX_DIR=/path/to/rpi-rgb-led-matrix cargo build --release --offline
+cargo build --release
 ```
 
 ## 运行
