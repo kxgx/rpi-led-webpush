@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: 检测代码变更（仅文档/打包元数据变更时跳过编译）
+      - name: 检测代码变更（仅文档变更时跳过；打包脚本/工作流变更也会构建）
         id: codechange
         run: |
           BASE=main
@@ -38,13 +38,21 @@ jobs:
           git fetch --no-tags origin "$BASE" 2>/dev/null || true
           if ! git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
             echo "code=true" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only "origin/$BASE...HEAD" -- . \
-            ':(exclude)*.md' ':(exclude)**/*.md' ':(exclude).github/**' ':(exclude)deploy/**' \
-            ':(exclude).gitignore' ':(exclude)LICENSE' > /tmp/changed.txt 2>/dev/null; then
-            if [ -s /tmp/changed.txt ]; then echo "code=true" >> "$GITHUB_OUTPUT"; else echo "code=false" >> "$GITHUB_OUTPUT"; fi
-          else
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          # 应用代码变更 → 必须编
+          if git diff --name-only "origin/$BASE...HEAD" -- . \
+            ':(exclude)*.md' ':(exclude)**/*.md' \
+            ':(exclude).gitignore' ':(exclude)LICENSE' > /tmp/changed.txt 2>/dev/null; then
+            if [ -s /tmp/changed.txt ]; then
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              echo "changed (incl. packaging):"; cat /tmp/changed.txt
+              exit 0
+            fi
+          fi
+          # 纯文档变更：跳过
+          echo "code=false" >> "$GITHUB_OUTPUT"
+          echo "docs-only change — skip deb matrix"
       - name: 校验打包脚本与版本一致性
         run: |
           test -x deploy/build-deb.sh
