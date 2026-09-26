@@ -70,6 +70,7 @@ echo "rpi-led-webpush installed."
 echo "  config:  /etc/rpi-led-webpush/config"
 echo "  start:   sudo systemctl enable --now rpi-led-webpush"
 echo "  web ui:  http://<device>:8080/  (camera/screen need HTTPS, see contrib/)"
+echo "  upgrade: sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold <deb>  # keep your config"
 EOF
 chmod 755 "$STAGE/DEBIAN/postinst"
 
