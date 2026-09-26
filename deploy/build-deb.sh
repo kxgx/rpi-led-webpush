@@ -37,8 +37,12 @@ install -m644 "$ROOT/README.md" "$ROOT/README.zh-CN.md" \
 install -m644 "$ROOT/third_party/rpi-rgb-led-matrix/COPYING" \
   "$STAGE/usr/share/doc/$PKG_NAME/COPYING.rpi-rgb-led-matrix"
 
-# systemd unit：二进制装到 /usr/bin，配置由 /etc/rpi-led-webpush/config 提供
-sed -i 's#/opt/rpi-led-webpush/rpi-led-webpush#/usr/bin/rpi-led-webpush#g' \
+# systemd unit：二进制装到 /usr/bin；配置由 /etc/rpi-led-webpush/config 提供
+# WorkingDirectory 不能指向未打包的 /opt 路径，否则 ExecStart 会 CHDIR 失败
+sed -i \
+  -e 's#/opt/rpi-led-webpush/rpi-led-webpush#/usr/bin/rpi-led-webpush#g' \
+  -e 's#WorkingDirectory=.*#WorkingDirectory=/var/lib/rpi-led-webpush#' \
+  -e 's#Settings live in .*#Settings live in /etc/rpi-led-webpush/config (editable at /settings).#' \
   "$STAGE/lib/systemd/system/rpi-led-webpush.service"
 
 cat > "$STAGE/DEBIAN/control" <<EOF
@@ -58,7 +62,7 @@ EOF
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/bash
 set -e
-mkdir -p /etc/rpi-led-webpush
+mkdir -p /etc/rpi-led-webpush /var/lib/rpi-led-webpush
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
 fi
