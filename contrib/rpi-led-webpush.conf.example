@@ -1,0 +1,64 @@
+# rpi-led-webpush configuration
+# Copy to ./rpi-led-webpush.conf (or /etc/rpi-led-webpush/config, or $LED_CONFIG)
+# CLI flags override this file for a single run; the web UI at /settings edits it.
+
+rows=32
+cols=64
+chain=1
+parallel=1
+
+# 1..100 — hot-applied from the web UI
+brightness=60
+
+# GPIO mapping: regular, adafruit-hat, adafruit-hat-pwm, classic, …
+mapping=regular
+
+# Channel order if your panel mixes green/blue etc.
+rgb_sequence=RGB
+
+# Web UI port; 0 disables the web server
+web_port=8080
+
+# 1 = dim blue breathing while idle (hot-applied)
+idle=1
+
+# ---- hardware driver ----
+# Special panel ICs that need a power-on init sequence (empty = generic)
+# panel_type=FM6126A
+# panel_type=FM6127
+panel_type=
+
+# GPIO timing slowdown 0..4 — raise if you see colour glitches
+gpio_slowdown=1
+
+# PWM depth 1..11 — lower uses less CPU and raises refresh rate
+pwm_bits=11
+pwm_lsb_ns=0
+pwm_dither=0
+
+# 0=progressive, 1=interlaced
+scan_mode=0
+
+# 0=direct; 1=A/B addressing (common on some 64x64 panels)
+row_address_type=0
+
+# 0=direct, 1=stripe, 2=checker (typical 1:8 multiplex)
+multiplexing=0
+
+# OE is not wired to GPIO 18
+no_hardware_pulse=0
+
+# Panel has inverted colours
+inverse_colors=0
+
+# Pixel mapper chain, e.g. "Rotate:90" or "U-mapper" (empty = none)
+pixel_mapper=
+
+# Cap panel refresh rate (Hz); 0 = unlimited
+limit_refresh_hz=0
+
+# Sleep instead of busy-wait when limit_refresh_hz is set
+no_busy_waiting=0
+
+# Pi 5 backend: 1=RP1 PIO (low CPU), 0=RP1 RIO
+rp1_pio=1

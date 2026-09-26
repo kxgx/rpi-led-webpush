@@ -9,12 +9,19 @@
 //! are sent over the WebSocket, so the device driving the panel stays nearly idle.
 //!
 //! ```text
-//!   browser  --HTTP-->  GET /            sender page (embedded)
-//!            --WS---->  /push           binary frames: [w u16][h u16][RGB...]
-//!            --HTTP-->  GET /geo        logical resolution, e.g. "64 32"
-//!            --WS---->  /ws             preview of what the panel shows (server → browser)
+//!   browser  --HTTP-->  GET /              sender page (embedded)
+//!            --WS---->  /push             binary frames: [w u16][h u16][RGB...]
+//!            --HTTP-->  GET /geo          logical resolution, e.g. "64 32"
+//!            --WS---->  /ws               preview of what the panel shows (server → browser)
+//!            --HTTP-->  GET /settings     device settings page
+//!            --HTTP-->  GET|POST /api/config
+//!            --HTTP-->  POST /api/restart
 //! ```
+//!
+//! Settings persist to a `key=value` file (see `config.rs`). CLI flags override the file
+//! for the current run; the web UI writes the file and applies hot settings immediately.
 
+mod config;
 mod ffi;
 mod web;
 
@@ -32,52 +39,55 @@ extern "C" fn on_signal(_sig: std::ffi::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-struct Args {
-    rows: i32,
-    cols: i32,
-    chain: i32,
-    parallel: i32,
-    brightness: i32,
-    mapping: String,
-    rgb_sequence: String,
-    web_port: u16,
-    idle: bool,
-}
-
 fn take_value(argv: &[String], i: &mut usize) -> Option<String> {
     *i += 1;
     argv.get(*i).cloned()
 }
 
-fn parse_args() -> Args {
-    let mut a = Args {
-        rows: 32,
-        cols: 64,
-        chain: 1,
-        parallel: 1,
-        brightness: 60,
-        mapping: "regular".to_string(),
-        rgb_sequence: "RGB".to_string(),
-        web_port: 8080,
-        idle: true,
-    };
+/// 把 CLI 覆盖到配置上（只覆盖显式给出的参数）。
+fn apply_cli(c: &mut config::Config) {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--rows" => if let Some(v) = take_value(&argv, &mut i) { a.rows = v.parse().unwrap_or(a.rows) },
-            "--cols" => if let Some(v) = take_value(&argv, &mut i) { a.cols = v.parse().unwrap_or(a.cols) },
-            "--chain" => if let Some(v) = take_value(&argv, &mut i) { a.chain = v.parse().unwrap_or(a.chain) },
-            "--parallel" => if let Some(v) = take_value(&argv, &mut i) { a.parallel = v.parse().unwrap_or(a.parallel) },
-            "--brightness" => if let Some(v) = take_value(&argv, &mut i) { a.brightness = v.parse().unwrap_or(a.brightness) },
-            "--web-port" => if let Some(v) = take_value(&argv, &mut i) { a.web_port = v.parse().unwrap_or(a.web_port) },
-            "--mapping" => if let Some(v) = take_value(&argv, &mut i) { a.mapping = v },
-            "--rgb-sequence" => if let Some(v) = take_value(&argv, &mut i) { a.rgb_sequence = v },
-            "--no-idle" => a.idle = false,
+            "--rows" => if let Some(v) = take_value(&argv, &mut i) { c.rows = v.parse().unwrap_or(c.rows) },
+            "--cols" => if let Some(v) = take_value(&argv, &mut i) { c.cols = v.parse().unwrap_or(c.cols) },
+            "--chain" => if let Some(v) = take_value(&argv, &mut i) { c.chain = v.parse().unwrap_or(c.chain) },
+            "--parallel" => if let Some(v) = take_value(&argv, &mut i) { c.parallel = v.parse().unwrap_or(c.parallel) },
+            "--brightness" => if let Some(v) = take_value(&argv, &mut i) { c.brightness = v.parse().unwrap_or(c.brightness) },
+            "--web-port" => if let Some(v) = take_value(&argv, &mut i) { c.web_port = v.parse().unwrap_or(c.web_port) },
+            "--mapping" => if let Some(v) = take_value(&argv, &mut i) { c.mapping = v },
+            "--rgb-sequence" => if let Some(v) = take_value(&argv, &mut i) { c.rgb_sequence = v },
+            "--no-idle" => c.idle = false,
+            // 硬件驱动
+            "--panel-type" | "--driver" => if let Some(v) = take_value(&argv, &mut i) { c.panel_type = v },
+            "--gpio-slowdown" => if let Some(v) = take_value(&argv, &mut i) { c.gpio_slowdown = v.parse().unwrap_or(c.gpio_slowdown) },
+            "--pwm-bits" => if let Some(v) = take_value(&argv, &mut i) { c.pwm_bits = v.parse().unwrap_or(c.pwm_bits) },
+            "--pwm-lsb-ns" => if let Some(v) = take_value(&argv, &mut i) { c.pwm_lsb_ns = v.parse().unwrap_or(c.pwm_lsb_ns) },
+            "--pwm-dither" => if let Some(v) = take_value(&argv, &mut i) { c.pwm_dither = v.parse().unwrap_or(c.pwm_dither) },
+            "--scan-mode" => if let Some(v) = take_value(&argv, &mut i) { c.scan_mode = v.parse().unwrap_or(c.scan_mode) },
+            "--row-addr-type" => if let Some(v) = take_value(&argv, &mut i) { c.row_address_type = v.parse().unwrap_or(c.row_address_type) },
+            "--multiplexing" => if let Some(v) = take_value(&argv, &mut i) { c.multiplexing = v.parse().unwrap_or(c.multiplexing) },
+            "--no-hardware-pulse" => c.no_hardware_pulse = true,
+            "--inverse" => c.inverse_colors = true,
+            "--pixel-mapper" => if let Some(v) = take_value(&argv, &mut i) { c.pixel_mapper = v },
+            "--limit-refresh" => if let Some(v) = take_value(&argv, &mut i) { c.limit_refresh_hz = v.parse().unwrap_or(c.limit_refresh_hz) },
+            "--no-busy-waiting" => c.no_busy_waiting = true,
+            "--rp1-rio" => c.rp1_pio = 0,
             "--help" | "-h" => {
-                println!("usage: rpi-led-webpush [--rows 32] [--cols 64] [--chain 1] [--parallel 1]");
-                println!("                [--brightness 60] [--web-port 8080] [--no-idle]");
-                println!("                [--mapping NAME] [--rgb-sequence RGB]");
+                println!("usage: rpi-led-webpush [options]");
+                println!("  panel:  --rows --cols --chain --parallel --brightness --no-idle");
+                println!("  wiring: --mapping NAME --rgb-sequence RGB");
+                println!("  web:    --web-port 8080");
+                println!("  driver: --panel-type TYPE   (FM6126A / FM6127, empty = generic)");
+                println!("          --gpio-slowdown 0..4 --pwm-bits 1..11 --pwm-lsb-ns NS");
+                println!("          --pwm-dither 0..2 --scan-mode 0|1 --row-addr-type 0..4");
+                println!("          --multiplexing N --no-hardware-pulse --inverse");
+                println!("          --pixel-mapper STR --limit-refresh HZ --no-busy-waiting");
+                println!("          --rp1-rio   (Pi 5: use RIO instead of PIO backend)");
+                println!();
+                println!("Settings are also stored in a config file (LED_CONFIG or ./rpi-led-webpush.conf)");
+                println!("and can be edited at http://<device>:PORT/settings");
                 exit(0);
             }
             other => {
@@ -87,17 +97,13 @@ fn parse_args() -> Args {
         }
         i += 1;
     }
-    a
+    c.normalize();
 }
 
 /// Refuse to start if another process may already be driving the panel: the RP1 PIO block has only
 /// four state machines and concurrent drivers corrupt each other's state.
 fn guard() {
     let me = std::process::id();
-    let self_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
-        .unwrap_or_default();
     let mut others: Vec<(String, String)> = Vec::new();
     if let Ok(entries) = fs::read_dir("/proc") {
         for e in entries.flatten() {
@@ -114,15 +120,12 @@ fn guard() {
             }
             let exe = cmd.split_whitespace().next().unwrap_or("");
             let exe_base = exe.rsplit('/').next().unwrap_or(exe);
-            if matches!(exe_base, "bash" | "sh" | "sudo" | "timeout" | "nohup" | "env" | "setsid") {
+            // Only treat executables whose name looks like an LED matrix driver as conflicts.
+            // Matching any cmdline containing "led-" would false-positive on grep/journalctl/vim.
+            if !is_led_driver(exe_base) {
                 continue;
             }
-            let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if cmd.contains("led-") || (!self_dir.is_empty() && cwd == self_dir) {
-                others.push((pid.to_string(), cmd.chars().take(110).collect()));
-            }
+            others.push((pid.to_string(), cmd.chars().take(110).collect()));
         }
     }
     if others.is_empty() {
@@ -141,8 +144,27 @@ fn guard() {
     exit(2);
 }
 
+/// Executable basenames that indicate another LED-matrix driver process.
+fn is_led_driver(exe_base: &str) -> bool {
+    let n = exe_base.to_ascii_lowercase();
+    // this binary, led-stats, and the upstream demo/test binaries
+    n == "rpi-led-webpush"
+        || n.starts_with("led-")
+        || n.starts_with("led_")
+        || n.ends_with("-led")
+        || n.contains("rgb-led-matrix")
+        || n.contains("led-matrix")
+        || n == "clockwise"
+}
+
 fn push_frame(canvas: *mut ffi::LedCanvas, pw: i32, ph: i32, sw: usize, sh: usize, rgb: &[u8]) {
-    if pw <= 0 || ph <= 0 || sw == 0 || sh == 0 || rgb.len() < sw * sh * 3 {
+    if pw <= 0 || ph <= 0 || sw == 0 || sh == 0 {
+        return;
+    }
+    let Some(need) = sw.checked_mul(sh).and_then(|n| n.checked_mul(3)) else {
+        return;
+    };
+    if rgb.len() < need {
         return;
     }
     // nearest-neighbour, in case the sender used a different size than the panel
@@ -159,7 +181,12 @@ fn push_frame(canvas: *mut ffi::LedCanvas, pw: i32, ph: i32, sw: usize, sh: usiz
 }
 
 fn main() {
-    let args = parse_args();
+    let shared_cfg = config::open();
+    let mut cfg = shared_cfg.get();
+    apply_cli(&mut cfg);
+    // CLI 覆盖并入内存配置，设置页显示的就是当前生效值；仅网页保存时写盘
+    shared_cfg.set_memory(cfg.clone());
+    let args = cfg.clone();
     guard();
     unsafe {
         ffi::register_signal(ffi::SIGINT, on_signal);
@@ -168,6 +195,9 @@ fn main() {
 
     let mapping = CString::new(args.mapping.clone()).unwrap();
     let seq = CString::new(args.rgb_sequence.clone()).unwrap();
+    // panel_type / pixel_mapper 允许为空 → 传 NULL，库走默认
+    let panel_type = CString::new(args.panel_type.clone()).unwrap();
+    let pixel_mapper = CString::new(args.pixel_mapper.clone()).unwrap();
     let mut opts: ffi::RGBLedMatrixOptions = unsafe { std::mem::zeroed() };
     opts.hardware_mapping = mapping.as_ptr();
     opts.rows = args.rows;
@@ -175,13 +205,36 @@ fn main() {
     opts.chain_length = args.chain;
     opts.parallel = args.parallel;
     opts.brightness = args.brightness;
-    opts.pwm_bits = 11;
+    opts.pwm_bits = args.pwm_bits;
+    opts.pwm_lsb_nanoseconds = args.pwm_lsb_ns;
+    opts.pwm_dither_bits = args.pwm_dither;
+    opts.scan_mode = args.scan_mode;
+    opts.row_address_type = args.row_address_type;
+    opts.multiplexing = args.multiplexing;
+    opts.disable_hardware_pulsing = args.no_hardware_pulse;
+    opts.inverse_colors = args.inverse_colors;
+    opts.limit_refresh_rate_hz = args.limit_refresh_hz;
+    opts.disable_busy_waiting = args.no_busy_waiting;
     opts.led_rgb_sequence = seq.as_ptr();
+    opts.panel_type = if args.panel_type.is_empty() {
+        std::ptr::null()
+    } else {
+        panel_type.as_ptr()
+    };
+    opts.pixel_mapper_config = if args.pixel_mapper.is_empty() {
+        std::ptr::null()
+    } else {
+        pixel_mapper.as_ptr()
+    };
 
-    let mut rt: ffi::RGBLedRuntimeOptions = unsafe { std::mem::zeroed() };
-    rt.rp1_pio = 1; // Raspberry Pi 5: the PIO backend is the low-CPU one
+    let mut rt_opts: ffi::RGBLedRuntimeOptions = unsafe { std::mem::zeroed() };
+    // RT_OPT_COPY_IF_SET：0 = 沿用默认。drop_privileges 必须显式 -1，否则会 setuid 到
+    // daemon，配置文件写不进 /root。daemon 保持 0（前台 + 允许刷新线程），不要用 -1。
+    rt_opts.drop_privileges = -1;
+    rt_opts.gpio_slowdown = args.gpio_slowdown;
+    rt_opts.rp1_pio = args.rp1_pio; // 1 = Pi 5 PIO (low CPU), 0 = RIO
 
-    let matrix = unsafe { ffi::led_matrix_create_from_options_and_rt_options(&mut opts, &mut rt) };
+    let matrix = unsafe { ffi::led_matrix_create_from_options_and_rt_options(&mut opts, &mut rt_opts) };
     if matrix.is_null() {
         eprintln!("could not initialise the panel (mapping / power / permissions?)");
         exit(1);
@@ -199,6 +252,7 @@ fn main() {
     let stop = Arc::new(AtomicBool::new(false));
     let mirror = web::new_mirror(lw as usize, lh as usize);
     let stream = web::new_stream();
+    let ctl = web::new_runtime(args.brightness, args.idle);
     if args.web_port > 0 {
         web::spawn_web_server(
             args.web_port,
@@ -206,20 +260,36 @@ fn main() {
             Arc::clone(&stream),
             (lw as usize, lh as usize),
             Arc::clone(&stop),
+            shared_cfg.clone(),
+            Arc::clone(&ctl),
         );
         println!("sender page : http://<device>:{}/", args.web_port);
         println!("panel preview: http://<device>:{}/view", args.web_port);
+        println!("settings page: http://<device>:{}/settings", args.web_port);
     }
     println!(
         "panel {}x{} (chain {}, parallel {}) mapping={} rgb-sequence={} brightness={}%",
         args.cols, args.rows, args.chain, args.parallel, args.mapping, args.rgb_sequence,
         args.brightness
     );
+    println!("config file: {}", shared_cfg.path().display());
     println!("waiting for a browser to push video… Ctrl-C to stop");
 
     let mut phase: f32 = 0.0;
     let mut was_streaming = false;
+    let mut last_brightness = args.brightness;
     while !STOP.load(Ordering::SeqCst) {
+        if ctl.restart.load(Ordering::SeqCst) {
+            println!("restart requested from web UI");
+            break;
+        }
+        // 网页改亮度后热更新，无需重开面板
+        let want = ctl.brightness.load(Ordering::SeqCst).clamp(1, 100);
+        if want != last_brightness {
+            unsafe { ffi::led_matrix_set_brightness(matrix, want as u8) };
+            last_brightness = want;
+            println!("brightness -> {want}%");
+        }
         if let Some((sw, sh, rgb)) = web::stream_active(&stream) {
             push_frame(canvas, lw, lh, sw, sh, &rgb);
             canvas = unsafe { ffi::led_matrix_swap_on_vsync(matrix, canvas) };
@@ -242,10 +312,29 @@ fn main() {
             println!("stream stopped");
         }
         // idle: a slow dim-blue breathing so it is obvious the program is alive
-        if args.idle {
+        if ctl.idle.load(Ordering::SeqCst) {
             phase = (phase + 0.04) % std::f32::consts::TAU;
             let v = (6.0 + 6.0 * (phase.sin() + 1.0)) as u8;
             unsafe { ffi::led_canvas_fill(canvas, 0, 0, v) };
+            canvas = unsafe { ffi::led_matrix_swap_on_vsync(matrix, canvas) };
+            // keep /view preview in sync with what the panel is actually showing
+            if let Ok(mut m) = mirror.lock() {
+                if m.w != lw as usize || m.h != lh as usize || m.rgb.len() != (lw * lh * 3) as usize {
+                    m.w = lw as usize;
+                    m.h = lh as usize;
+                    m.rgb.resize((lw * lh * 3) as usize, 0);
+                }
+                for px in m.rgb.chunks_exact_mut(3) {
+                    px[0] = 0;
+                    px[1] = 0;
+                    px[2] = v;
+                }
+                m.seq += 1;
+                m.page.clear();
+            }
+        } else {
+            // 空闲且关闭了呼吸：保持黑屏，但仍刷新 mirror 以免预览漂在旧帧上
+            unsafe { ffi::led_canvas_fill(canvas, 0, 0, 0) };
             canvas = unsafe { ffi::led_matrix_swap_on_vsync(matrix, canvas) };
         }
         thread::sleep(Duration::from_millis(40));

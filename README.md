@@ -22,9 +22,48 @@ device driving the panel stays almost idle.
 |---|---|---|
 | `/` | GET | sender page (embedded): video file / camera / screen share, fit modes |
 | `/view` | GET | live preview of what the panel is displaying right now |
+| `/settings` | GET | device settings page (panel size, brightness, mapping, …) |
 | `/geo` | GET | logical resolution, e.g. `64 32` |
+| `/api/config` | GET | current settings + runtime info (JSON) |
+| `/api/config` | POST | update settings (`application/x-www-form-urlencoded`); persisted |
+| `/api/restart` | POST | stop cleanly so the supervisor can restart (new geometry etc.) |
 | `/push` | WebSocket | sender → device: binary frames `[w u16][h u16][RGB…]` (little-endian) |
 | `/ws` | WebSocket | device → browser: the same frame format, for the preview |
+
+## Settings & persistence
+
+Settings live in a plain `key=value` file (no format library):
+
+* `LED_CONFIG` if set, else `/etc/rpi-led-webpush/config`, else `./rpi-led-webpush.conf`
+* CLI flags override the file **for that run only**; the web UI edits the file.
+* **Hot-applied** (no restart): `brightness`, `idle`.
+* **Need restart** (`POST /api/restart`): geometry (`rows`/`cols`/`chain`/`parallel`),
+  wiring (`mapping`/`rgb_sequence`), `web_port`, and all **hardware driver** options below.
+
+### Hardware driver options
+
+These map onto `rpi-rgb-led-matrix`'s init parameters (same as `--led-*` flags) and take effect
+at panel bring-up:
+
+| Key | CLI | Notes |
+|---|---|---|
+| `panel_type` | `--panel-type` | `FM6126A` / `FM6127` (empty = generic) |
+| `gpio_slowdown` | `--gpio-slowdown` | 0..4 |
+| `pwm_bits` | `--pwm-bits` | 1..11 |
+| `pwm_lsb_ns` | `--pwm-lsb-ns` | nanoseconds |
+| `pwm_dither` | `--pwm-dither` | 0..2 |
+| `scan_mode` | `--scan-mode` | 0 progressive / 1 interlaced |
+| `row_address_type` | `--row-addr-type` | 0..4 |
+| `multiplexing` | `--multiplexing` | 0 direct, 2 = 1:8 checker |
+| `no_hardware_pulse` | `--no-hardware-pulse` | OE not on GPIO 18 |
+| `inverse_colors` | `--inverse` | |
+| `pixel_mapper` | `--pixel-mapper` | e.g. `Rotate:90` |
+| `limit_refresh_hz` | `--limit-refresh` | 0 = unlimited |
+| `no_busy_waiting` | `--no-busy-waiting` | |
+| `rp1_pio` | `--rp1-rio` to disable | Pi 5: 1=PIO (default), 0=RIO |
+
+When running under systemd, prefer `ExecStart` without CLI flags (see `contrib/`) so the
+web-saved config is what restarts with.
 
 ## Behaviour worth knowing
 

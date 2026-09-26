@@ -11,9 +11,11 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+use crate::config::{ApplyOutcome, SharedConfig};
 
 pub struct Mirror {
     pub w: usize,
@@ -36,9 +38,28 @@ pub fn new_mirror(w: usize, h: usize) -> SharedMirror {
     }))
 }
 
+/// 主循环与网页设置之间共享的运行时控制。
+pub struct RuntimeCtl {
+    /// 目标亮度 1..100；主循环据此调用 led_matrix_set_brightness
+    pub brightness: AtomicI32,
+    pub idle: AtomicBool,
+    pub restart: AtomicBool,
+}
+
+pub type SharedRuntime = Arc<RuntimeCtl>;
+
+pub fn new_runtime(brightness: i32, idle: bool) -> SharedRuntime {
+    Arc::new(RuntimeCtl {
+        brightness: AtomicI32::new(brightness),
+        idle: AtomicBool::new(idle),
+        restart: AtomicBool::new(false),
+    })
+}
+
 /// 启动网页服务（在后台线程里 accept）
 pub fn spawn_web_server(port: u16, mirror: SharedMirror, stream: SharedStream,
-                        geometry: (usize, usize), stop: Arc<AtomicBool>) {
+                        geometry: (usize, usize), stop: Arc<AtomicBool>,
+                        cfg: SharedConfig, rt: SharedRuntime) {
     thread::spawn(move || {
         let listener = match TcpListener::bind(("0.0.0.0", port)) {
             Ok(l) => l,
@@ -47,7 +68,7 @@ pub fn spawn_web_server(port: u16, mirror: SharedMirror, stream: SharedStream,
                 return;
             }
         };
-        println!("网页实时预览: http://<本机IP>:{port}/");
+        println!("设置页面: http://<本机IP>:{port}/settings");
         for conn in listener.incoming() {
             if stop.load(Ordering::Relaxed) {
                 return;
@@ -55,21 +76,32 @@ pub fn spawn_web_server(port: u16, mirror: SharedMirror, stream: SharedStream,
             let Ok(conn) = conn else { continue };
             let m = Arc::clone(&mirror);
             let st = Arc::clone(&stream);
+            let cf = cfg.clone();
+            let rt = Arc::clone(&rt);
             thread::spawn(move || {
-                let _ = handle_client(conn, m, st, geometry);
+                let _ = handle_client(conn, m, st, geometry, cf, rt);
             });
         }
     });
 }
 
 fn handle_client(mut s: TcpStream, mirror: SharedMirror, stream: SharedStream,
-                 geometry: (usize, usize)) -> std::io::Result<()> {
+                 geometry: (usize, usize), cfg: SharedConfig, rt: SharedRuntime)
+                 -> std::io::Result<()> {
+    let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     s.set_nodelay(true).ok();
+    // 避免对端挂起不发数据时线程永久阻塞（无鉴权端口，恶意/异常客户端都可能来）
+    s.set_read_timeout(Some(std::time::Duration::from_secs(120))).ok();
+    s.set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
     let mut reader = BufReader::new(s.try_clone()?);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    if reader.read_line(&mut request_line).is_err() || request_line.trim().is_empty() {
+        let _ = write_http(&mut s, "400 Bad Request", "text/plain", b"bad request");
+        return Ok(());
+    }
 
     let mut ws_key: Option<String> = None;
+    let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -80,29 +112,395 @@ fn handle_client(mut s: TcpStream, mirror: SharedMirror, stream: SharedStream,
             break;
         }
         if let Some((k, v)) = t.split_once(':') {
+            let (k, v) = (k.trim(), v.trim());
             if k.eq_ignore_ascii_case("Sec-WebSocket-Key") {
-                ws_key = Some(v.trim().to_string());
+                ws_key = Some(v.to_string());
+            } else if k.eq_ignore_ascii_case("Content-Length") {
+                content_length = v.parse().unwrap_or(0).min(64 * 1024);
             }
         }
     }
 
-    let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
-    let path = path.split('?').next().unwrap_or("/").to_string();
-    match path.as_str() {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_ascii_uppercase();
+    let target = parts.next().unwrap_or("/").to_string();
+    eprintln!("[http] {peer} {method} {target}");
+    let (path_only, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target.clone(), String::new()),
+    };
+    // 读请求体（用于 POST /api/config）
+    let mut body = Vec::new();
+    if content_length > 0 && method != "GET" {
+        body.resize(content_length, 0);
+        if reader.read_exact(&mut body).is_err() {
+            body.clear();
+        }
+    }
+
+    // BufReader 可能已经预读了 WebSocket 首帧；必须把缓冲区里剩余字节一并交给 WS 处理，
+    // 否则那些字节会被丢掉，握手后的第一条帧永远读不齐。
+    let leftover = {
+        let pending = reader.buffer().to_vec();
+        reader.consume(pending.len());
+        pending
+    };
+
+    match path_only.as_str() {
         "/ws" => match ws_key {
-            Some(key) => ws_stream(s, &key, mirror),
+            Some(key) => ws_stream(s, &key, mirror, leftover),
             None => write_http(&mut s, "400 Bad Request", "text/plain", b"websocket upgrade required"),
         },
         "/push" => match ws_key {
-            Some(key) => ws_receive(s, &key, stream),
+            Some(key) => ws_receive(s, &key, stream, leftover),
             None => write_http(&mut s, "400 Bad Request", "text/plain", b"websocket upgrade required"),
         },
         "/geo" => {
             let body = format!("{} {}", geometry.0, geometry.1);
             write_http(&mut s, "200 OK", "text/plain", body.as_bytes())
         }
+        "/api/config" => {
+            if method == "GET" {
+                let json = config_json(&cfg, &rt, &stream, geometry);
+                write_http(&mut s, "200 OK", "application/json; charset=utf-8", json.as_bytes())
+            } else {
+                api_config_set(&mut s, &cfg, &rt, &query, &body)
+            }
+        }
+        "/api/restart" => {
+            rt.restart.store(true, Ordering::SeqCst);
+            write_http(&mut s, "200 OK", "application/json; charset=utf-8",
+                       br#"{"ok":true,"restarting":true}"#)
+        }
+        // 实时亮度：只动 brightness，不碰其他设置，不触发 restart
+        "/api/brightness" => {
+            if method == "GET" {
+                let v = rt.brightness.load(Ordering::Relaxed);
+                let body = format!(r#"{{"brightness":{v}}}"#);
+                write_http(&mut s, "200 OK", "application/json; charset=utf-8", body.as_bytes())
+            } else {
+                api_brightness_set(&mut s, &cfg, &rt, &query, &body)
+            }
+        }
+        "/settings" => write_http(&mut s, "200 OK", "text/html; charset=utf-8", SETTINGS_HTML.as_bytes()),
         "/view" => write_http(&mut s, "200 OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
         _ => write_http(&mut s, "200 OK", "text/html; charset=utf-8", SENDER_HTML.as_bytes()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SharedConfig;
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    fn get(port: u16, path: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).unwrap();
+        buf
+    }
+
+    fn post(port: u16, path: &str, body: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(format!(
+            "POST {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ).as_bytes()).unwrap();
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn http_config_roundtrip_and_pages() {
+        let dir = std::env::temp_dir().join(format!("lpwp-http-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path: PathBuf = dir.join("c.conf");
+        let cfg = SharedConfig::open_at(path.clone());
+        // pick a free port
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mirror = new_mirror(64, 32);
+        let stream = new_stream();
+        let stop = Arc::new(AtomicBool::new(false));
+        let rt = new_runtime(60, true);
+        spawn_web_server(port, mirror, stream, (64, 32), Arc::clone(&stop), cfg.clone(), Arc::clone(&rt));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let settings = get(port, "/settings");
+        assert!(settings.contains("200 OK"), "settings: {settings}");
+        assert!(settings.contains("LED 面板设置"));
+
+        let geo = get(port, "/geo");
+        assert!(geo.contains("64 32"));
+
+        let cfg_get = get(port, "/api/config");
+        assert!(cfg_get.contains("\"rows\":32"), "cfg: {cfg_get}");
+        assert!(cfg_get.contains("\"brightness\":60"));
+
+        let upd = post(port, "/api/config", "brightness=75&idle=0&cols=128");
+        assert!(upd.contains("\"ok\":true"), "upd: {upd}");
+        assert!(upd.contains("restart_required\":true"), "cols change needs restart: {upd}");
+        assert_eq!(rt.brightness.load(Ordering::SeqCst), 75);
+        assert!(!rt.idle.load(Ordering::SeqCst));
+
+        let upd2 = post(port, "/api/config", "brightness=50");
+        assert!(upd2.contains("restart_required\":false"), "hot-only: {upd2}");
+
+        // 硬件驱动参数：改 panel_type / gpio_slowdown 应要求重启，并写入配置
+        let drv = post(port, "/api/config",
+                       "panel_type=FM6126A&gpio_slowdown=3&pwm_bits=8&inverse_colors=1");
+        assert!(drv.contains("restart_required\":true"), "driver change: {drv}");
+        // 写盘必须真的落盘，不能只改内存
+        let on_disk = std::fs::read_to_string(&path).expect("config file must exist after POST");
+        assert!(on_disk.contains("panel_type=FM6126A"), "disk: {on_disk}");
+        assert!(on_disk.contains("gpio_slowdown=3"));
+        let after = get(port, "/api/config");
+        assert!(after.contains("\"panel_type\":\"FM6126A\""), "got: {after}");
+        assert!(after.contains("\"gpio_slowdown\":3"));
+        assert!(after.contains("\"pwm_bits\":8"));
+        assert!(after.contains("\"inverse_colors\":true"));
+
+        let restart = post(port, "/api/restart", "");
+        assert!(restart.contains("\"ok\":true"));
+        assert!(rt.restart.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn api_brightness_live() {
+        let dir = std::env::temp_dir().join(format!("lpwp-br-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("c.conf");
+        let cfg = SharedConfig::open_at(path.clone());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let stop = Arc::new(AtomicBool::new(false));
+        let rt = new_runtime(60, true);
+        spawn_web_server(port, new_mirror(64, 32), new_stream(), (64, 32),
+                         Arc::clone(&stop), cfg.clone(), Arc::clone(&rt));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let r = post(port, "/api/brightness", "brightness=27");
+        assert!(r.contains("\"brightness\":27"), "{r}");
+        assert_eq!(rt.brightness.load(Ordering::SeqCst), 27);
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(disk.contains("brightness=27"), "{disk}");
+        // 越界钳制
+        let r = post(port, "/api/brightness", "brightness=200");
+        assert!(r.contains("\"brightness\":100"), "{r}");
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 把 `a=b&c=d` 解析成键值对（urlencoded）。
+fn parse_kv(s: &str) -> Vec<(String, String)> {
+    s.split('&')
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            Some((urldecode(k), urldecode(v)))
+        })
+        .collect()
+}
+
+fn urldecode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(v) => {
+                        out.push(v);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn config_json(cfg: &SharedConfig, rt: &SharedRuntime, stream: &SharedStream,
+               geometry: (usize, usize)) -> String {
+    let c = cfg.get();
+    let streaming = stream_active(stream).is_some();
+    format!(
+        r#"{{"settings":{{"rows":{rows},"cols":{cols},"chain":{chain},"parallel":{parallel},
+        "brightness":{brightness},"mapping":"{mapping}","rgb_sequence":"{rgb_sequence}",
+        "web_port":{web_port},"idle":{idle},
+        "panel_type":"{panel_type}","gpio_slowdown":{gpio_slowdown},
+        "pwm_bits":{pwm_bits},"pwm_lsb_ns":{pwm_lsb_ns},"pwm_dither":{pwm_dither},
+        "scan_mode":{scan_mode},"row_address_type":{row_addr},"multiplexing":{mux},
+        "no_hardware_pulse":{no_pulse},"inverse_colors":{inv},
+        "pixel_mapper":"{pixmap}","limit_refresh_hz":{lim},
+        "no_busy_waiting":{nobusy},"rp1_pio":{rp1}}},
+        "runtime":{{"panel_width":{gw},"panel_height":{gh},"streaming":{streaming},
+        "brightness_now":{bnow},"config_path":"{cpath}"}}}}"#,
+        rows = c.rows,
+        cols = c.cols,
+        chain = c.chain,
+        parallel = c.parallel,
+        brightness = c.brightness,
+        mapping = json_escape(&c.mapping),
+        rgb_sequence = json_escape(&c.rgb_sequence),
+        web_port = c.web_port,
+        idle = c.idle,
+        panel_type = json_escape(&c.panel_type),
+        gpio_slowdown = c.gpio_slowdown,
+        pwm_bits = c.pwm_bits,
+        pwm_lsb_ns = c.pwm_lsb_ns,
+        pwm_dither = c.pwm_dither,
+        scan_mode = c.scan_mode,
+        row_addr = c.row_address_type,
+        mux = c.multiplexing,
+        no_pulse = c.no_hardware_pulse,
+        inv = c.inverse_colors,
+        pixmap = json_escape(&c.pixel_mapper),
+        lim = c.limit_refresh_hz,
+        nobusy = c.no_busy_waiting,
+        rp1 = c.rp1_pio,
+        gw = geometry.0,
+        gh = geometry.1,
+        streaming = streaming,
+        bnow = rt.brightness.load(Ordering::Relaxed),
+        cpath = json_escape(&cfg.path().display().to_string()),
+    )
+}
+
+fn api_brightness_set(s: &mut TcpStream, cfg: &SharedConfig, rt: &SharedRuntime,
+                      query: &str, body: &[u8]) -> std::io::Result<()> {
+    let mut kvs = parse_kv(query);
+    kvs.extend(parse_kv(&String::from_utf8_lossy(body)));
+    let mut v: Option<i32> = None;
+    for (k, val) in kvs {
+        if k == "brightness" || k == "value" {
+            if let Ok(n) = val.parse::<i32>() {
+                v = Some(n.clamp(1, 100));
+            }
+        }
+    }
+    let Some(val) = v else {
+        return write_http(s, "400 Bad Request", "application/json; charset=utf-8",
+                          br#"{"ok":false,"error":"missing brightness"}"#);
+    };
+    // 立刻生效（主循环下一轮 led_matrix_set_brightness）
+    rt.brightness.store(val, Ordering::SeqCst);
+    // 并写入配置，重启后保持
+    let mut c = cfg.get();
+    c.brightness = val;
+    match cfg.update(c) {
+        ApplyOutcome::SaveFailed(e) => {
+            let msg = format!(r#"{{"ok":true,"brightness":{val},"save_error":"{}"}}"#, json_escape(&e));
+            return write_http(s, "200 OK", "application/json; charset=utf-8", msg.as_bytes());
+        }
+        _ => {}
+    }
+    let msg = format!(r#"{{"ok":true,"brightness":{val}}}"#);
+    write_http(s, "200 OK", "application/json; charset=utf-8", msg.as_bytes())
+}
+
+fn api_config_set(s: &mut TcpStream, cfg: &SharedConfig, rt: &SharedRuntime,
+                  query: &str, body: &[u8]) -> std::io::Result<()> {
+    let mut kvs = parse_kv(query);
+    kvs.extend(parse_kv(&String::from_utf8_lossy(body)));
+    let mut c = cfg.get();
+    for (k, v) in kvs {
+        match k.as_str() {
+            "rows" => if let Ok(n) = v.parse() { c.rows = n },
+            "cols" => if let Ok(n) = v.parse() { c.cols = n },
+            "chain" => if let Ok(n) = v.parse() { c.chain = n },
+            "parallel" => if let Ok(n) = v.parse() { c.parallel = n },
+            "brightness" => if let Ok(n) = v.parse::<i32>() { c.brightness = n.clamp(1, 100) },
+            "mapping" => if !v.is_empty() { c.mapping = v },
+            "rgb_sequence" => if !v.is_empty() { c.rgb_sequence = v },
+            "web_port" => if let Ok(n) = v.parse() { c.web_port = n },
+            "idle" => c.idle = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+            // 硬件驱动
+            "panel_type" | "driver" => c.panel_type = v,
+            "gpio_slowdown" => if let Ok(n) = v.parse() { c.gpio_slowdown = n },
+            "pwm_bits" => if let Ok(n) = v.parse() { c.pwm_bits = n },
+            "pwm_lsb_ns" | "pwm_lsb_nanoseconds" => if let Ok(n) = v.parse() { c.pwm_lsb_ns = n },
+            "pwm_dither" | "pwm_dither_bits" => if let Ok(n) = v.parse() { c.pwm_dither = n },
+            "scan_mode" => if let Ok(n) = v.parse() { c.scan_mode = n },
+            "row_address_type" => if let Ok(n) = v.parse() { c.row_address_type = n },
+            "multiplexing" => if let Ok(n) = v.parse() { c.multiplexing = n },
+            "no_hardware_pulse" => c.no_hardware_pulse = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+            "inverse_colors" => c.inverse_colors = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+            "pixel_mapper" | "pixel_mapper_config" => c.pixel_mapper = v,
+            "limit_refresh_hz" | "limit_refresh_rate_hz" => if let Ok(n) = v.parse() { c.limit_refresh_hz = n },
+            "no_busy_waiting" | "disable_busy_waiting" => {
+                c.no_busy_waiting = matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            }
+            "rp1_pio" => if let Ok(n) = v.parse::<i32>() { c.rp1_pio = if n != 0 { 1 } else { 0 } },
+            _ => {}
+        }
+    }
+    c.normalize();
+    let outcome = cfg.update(c.clone());
+    match outcome {
+        ApplyOutcome::SaveFailed(err) => {
+            let msg = format!(
+                r#"{{"ok":false,"error":"save failed: {}"}}"#,
+                json_escape(&err)
+            );
+            return write_http(s, "500 Internal Server Error", "application/json; charset=utf-8",
+                              msg.as_bytes());
+        }
+        ApplyOutcome::NeedsRestart => {
+            // 运行时可热更的字段仍然立刻生效
+            rt.brightness.store(c.brightness, Ordering::SeqCst);
+            rt.idle.store(c.idle, Ordering::SeqCst);
+            write_http(s, "200 OK", "application/json; charset=utf-8",
+                       r#"{"ok":true,"restart_required":true,"hint":"hardware/geometry settings changed — POST /api/restart"}"#.as_bytes())
+        }
+        ApplyOutcome::Applied => {
+            rt.brightness.store(c.brightness, Ordering::SeqCst);
+            rt.idle.store(c.idle, Ordering::SeqCst);
+            write_http(s, "200 OK", "application/json; charset=utf-8",
+                       br#"{"ok":true,"restart_required":false}"#)
+        }
     }
 }
 
@@ -142,7 +540,7 @@ pub fn new_stream() -> SharedStream {
     Arc::new(Mutex::new(StreamBuffer::default()))
 }
 
-/// 最近还在投送吗（默认 2 秒内算活跃）
+/// 最近还在投送吗（默认 5 秒内算活跃）
 pub fn stream_active(stream: &SharedStream) -> Option<(usize, usize, Vec<u8>)> {
     let s = stream.lock().ok()?;
     let at = s.at?;
@@ -152,8 +550,11 @@ pub fn stream_active(stream: &SharedStream) -> Option<(usize, usize, Vec<u8>)> {
     Some((s.w, s.h, s.rgb.clone()))
 }
 
-/// 接收投送端（浏览器）发来的帧；客户端帧带掩码，需要解掩码
-fn ws_receive(mut s: TcpStream, key: &str, stream: SharedStream) -> std::io::Result<()> {
+/// 接收投送端（浏览器）发来的帧；客户端帧带掩码，需要解掩码。
+/// `leftover` 是 HTTP 握手解析时 BufReader 多读出来的字节（通常是首帧开头）。
+fn ws_receive(s: TcpStream, key: &str, stream: SharedStream, leftover: Vec<u8>)
+              -> std::io::Result<()> {
+    let mut s = s;
     let accept = base64(&sha1(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes()));
     s.write_all(format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
@@ -161,10 +562,12 @@ fn ws_receive(mut s: TcpStream, key: &str, stream: SharedStream) -> std::io::Res
     ).as_bytes())?;
     s.flush()?;
 
+    let mut fr = FrameReader { sock: s, pending: leftover, pos: 0 };
+
     const MAX_FRAME: usize = 4 * 1024 * 1024;
     loop {
         let mut h = [0u8; 2];
-        if s.read_exact(&mut h).is_err() {
+        if fr.read_exact(&mut h).is_err() {
             return Ok(());
         }
         let opcode = h[0] & 0x0f;
@@ -172,22 +575,31 @@ fn ws_receive(mut s: TcpStream, key: &str, stream: SharedStream) -> std::io::Res
         let mut len = (h[1] & 0x7f) as u64;
         if len == 126 {
             let mut b = [0u8; 2];
-            s.read_exact(&mut b)?;
+            if fr.read_exact(&mut b).is_err() {
+                return Ok(());
+            }
             len = u16::from_be_bytes(b) as u64;
         } else if len == 127 {
             let mut b = [0u8; 8];
-            s.read_exact(&mut b)?;
+            if fr.read_exact(&mut b).is_err() {
+                return Ok(());
+            }
             len = u64::from_be_bytes(b);
         }
-        if len as usize > MAX_FRAME {
+        // `len as usize` can silently truncate a huge u64 on 32-bit targets and then
+        // desync the stream; reject anything that cannot fit in usize / MAX_FRAME.
+        let Ok(len_usize) = usize::try_from(len) else {
+            return Ok(());
+        };
+        if len_usize > MAX_FRAME {
             return Ok(()); // 异常大帧，断开
         }
         let mut mask = [0u8; 4];
-        if masked {
-            s.read_exact(&mut mask)?;
+        if masked && fr.read_exact(&mut mask).is_err() {
+            return Ok(());
         }
-        let mut data = vec![0u8; len as usize];
-        if s.read_exact(&mut data).is_err() {
+        let mut data = vec![0u8; len_usize];
+        if fr.read_exact(&mut data).is_err() {
             return Ok(());
         }
         if masked {
@@ -201,29 +613,78 @@ fn ws_receive(mut s: TcpStream, key: &str, stream: SharedStream) -> std::io::Res
                 if data.len() >= 4 {
                     let w = u16::from_le_bytes([data[0], data[1]]) as usize;
                     let h = u16::from_le_bytes([data[2], data[3]]) as usize;
-                    let need = w * h * 3;
-                    if w > 0 && h > 0 && data.len() >= 4 + need {
-                        if let Ok(mut st) = stream.lock() {
-                            st.rgb.clear();
-                            st.rgb.extend_from_slice(&data[4..4 + need]);
-                            st.w = w;
-                            st.h = h;
-                            st.seq += 1;
-                            st.at = Some(std::time::Instant::now());
+                    // checked: a crafted w*h*3 must not wrap and then slip past the length check
+                    if let Some(need) = w.checked_mul(h).and_then(|n| n.checked_mul(3)) {
+                        if w > 0 && h > 0 {
+                            if let Some(total) = need.checked_add(4) {
+                                if data.len() >= total {
+                                    if let Ok(mut st) = stream.lock() {
+                                        st.rgb.clear();
+                                        st.rgb.extend_from_slice(&data[4..4 + need]);
+                                        st.w = w;
+                                        st.h = h;
+                                        st.seq += 1;
+                                        st.at = Some(std::time::Instant::now());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
             0x8 => return Ok(()),          // close
-            0x9 => { /* ping：忽略（浏览器很少发） */ }
+            0x9 => {
+                // ping：必须回 pong，否则部分浏览器/代理会断开
+                let mut pong = Vec::with_capacity(2 + data.len());
+                pong.push(0x8a); // FIN + pong
+                if data.len() < 126 {
+                    pong.push(data.len() as u8);
+                } else if data.len() < 65536 {
+                    pong.push(126);
+                    pong.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                } else {
+                    pong.push(127);
+                    pong.extend_from_slice(&(data.len() as u64).to_be_bytes());
+                }
+                pong.extend_from_slice(&data);
+                if fr.sock.write_all(&pong).is_err() {
+                    return Ok(());
+                }
+            }
             _ => {}
         }
     }
 }
 
+/// 先读握手剩余缓冲，再读 socket，避免 BufReader 预读丢字节。
+struct FrameReader {
+    sock: TcpStream,
+    pending: Vec<u8>,
+    pos: usize,
+}
+
+impl FrameReader {
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            if self.pos < self.pending.len() {
+                let n = (self.pending.len() - self.pos).min(buf.len() - filled);
+                buf[filled..filled + n]
+                    .copy_from_slice(&self.pending[self.pos..self.pos + n]);
+                self.pos += n;
+                filled += n;
+            } else {
+                self.sock.read_exact(&mut buf[filled..])?;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- WebSocket
 
-fn ws_stream(mut s: TcpStream, key: &str, mirror: SharedMirror) -> std::io::Result<()> {
+fn ws_stream(mut s: TcpStream, key: &str, mirror: SharedMirror, _leftover: Vec<u8>) -> std::io::Result<()> {
     let accept = base64(&sha1(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes()));
     let resp = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
@@ -346,6 +807,276 @@ fn base64(data: &[u8]) -> String {
 
 // ---------------------------------------------------------------- 内嵌前端页面
 
+const SETTINGS_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>LED 面板设置</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; background:#0b0d10; color:#c9d1d9;
+         font:14px/1.5 system-ui,-apple-system,"Noto Sans CJK SC",sans-serif;
+         padding:20px 16px 48px; }
+  .wrap { max-width:720px; margin:0 auto; }
+  header { display:flex; align-items:baseline; justify-content:space-between;
+           gap:12px; flex-wrap:wrap; margin-bottom:18px; }
+  h1 { font-size:18px; font-weight:600; margin:0; letter-spacing:.02em; }
+  h1 .sub { font-weight:400; color:#6e7681; font-size:13px; margin-left:8px; }
+  nav a { color:#58a6ff; text-decoration:none; margin-left:14px; font-size:13px; }
+  nav a:hover { text-decoration:underline; }
+  section { background:#0e1116; border:1px solid #21262d; border-radius:12px;
+            padding:16px 18px; margin-bottom:14px; }
+  section h2 { margin:0 0 12px; font-size:12px; font-weight:600; color:#8b949e;
+               text-transform:uppercase; letter-spacing:.08em; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:12px 14px; }
+  label { display:flex; flex-direction:column; gap:5px; font-size:12px; color:#8b949e; }
+  label span.tag { font-size:11px; color:#6e7681; }
+  input, select { background:#161b22; color:#e6edf3; border:1px solid #30363d;
+                  border-radius:8px; padding:8px 10px; font:inherit; width:100%; }
+  input:focus, select:focus { outline:none; border-color:#58a6ff; }
+  .check { flex-direction:row; align-items:center; gap:8px; padding-top:22px; }
+  .check input { width:auto; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:16px; }
+  button { background:#21262d; color:#c9d1d9; border:1px solid #30363d; border-radius:8px;
+           padding:8px 16px; cursor:pointer; font:inherit; }
+  button:hover { background:#30363d; }
+  button.primary { background:#238636; border-color:#2ea043; color:#fff; }
+  button.primary:hover { background:#2ea043; }
+  button.danger { background:#21262d; border-color:#f85149; color:#f85149; }
+  button.danger:hover { background:#3d1418; }
+  .status { font-size:13px; color:#8b949e; min-height:1.2em; }
+  .status.ok { color:#3fb950; }
+  .status.warn { color:#d29922; }
+  .status.err { color:#f85149; }
+  .meta { font-size:12px; color:#6e7681; line-height:1.7; }
+  .meta b { color:#8b949e; font-weight:500; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:11px;
+          border:1px solid #30363d; color:#8b949e; }
+  .pill.on { border-color:#238636; color:#3fb950; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>LED 面板设置<span class="sub">rpi-led-webpush</span></h1>
+    <nav>
+      <a href="/">投送</a>
+      <a href="/view">预览</a>
+      <a href="/settings">设置</a>
+    </nav>
+  </header>
+
+  <section>
+    <h2>面板</h2>
+    <div class="grid">
+      <label>行 rows<span class="tag">面板高度 / 1 块</span>
+        <input id="rows" type="number" min="1" max="512"></label>
+      <label>列 cols<span class="tag">面板宽度 / 1 块</span>
+        <input id="cols" type="number" min="1" max="512"></label>
+      <label>串联 chain<span class="tag">左右拼接</span>
+        <input id="chain" type="number" min="1" max="32"></label>
+      <label>并联 parallel<span class="tag">上下拼接</span>
+        <input id="parallel" type="number" min="1" max="8"></label>
+      <label>亮度 %<span class="tag">拖动即时生效</span>
+        <input id="brightness" type="range" min="1" max="100" step="1" style="padding:0">
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:#6e7681">
+          <span>1</span><span id="brightness_val">—</span><span>100</span>
+        </div>
+      </label>
+      <label class="check"><input id="idle" type="checkbox"> 空闲呼吸</label>
+    </div>
+  </section>
+
+  <section>
+    <h2>硬件</h2>
+    <div class="grid">
+      <label>GPIO 映射 mapping
+        <select id="mapping">
+          <option>regular</option>
+          <option>adafruit-hat</option>
+          <option>adafruit-hat-pwm</option>
+          <option>classic</option>
+          <option>compute-module</option>
+          <option>regular-pi1</option>
+        </select></label>
+      <label>RGB 顺序 rgb-sequence<span class="tag">如绿蓝对调填 RBG</span>
+        <input id="rgb_sequence" type="text" maxlength="3"></label>
+      <label>网页端口 web-port<span class="tag">0 = 关闭网页</span>
+        <input id="web_port" type="number" min="0" max="65535"></label>
+    </div>
+  </section>
+
+  <section>
+    <h2>驱动芯片 / 初始化</h2>
+    <div class="grid">
+      <label>面板类型 panel-type<span class="tag">特殊 IC 需要上电序列</span>
+        <select id="panel_type">
+          <option value="">通用（无初始化）</option>
+          <option value="FM6126A">FM6126A</option>
+          <option value="FM6127">FM6127</option>
+        </select></label>
+      <label>GPIO 减速 gpio-slowdown<span class="tag">0–4，花屏/丢色加大</span>
+        <input id="gpio_slowdown" type="number" min="0" max="4"></label>
+      <label>PWM 位深 pwm-bits<span class="tag">1–11，越低越省 CPU</span>
+        <input id="pwm_bits" type="number" min="1" max="11"></label>
+      <label>PWM LSB (ns)<span class="tag">0–200，鬼影可加大</span>
+        <input id="pwm_lsb_ns" type="number" min="0" max="200"></label>
+      <label>PWM 抖动 pwm-dither<span class="tag">0–2</span>
+        <input id="pwm_dither" type="number" min="0" max="2"></label>
+      <label>扫描 scan-mode
+        <select id="scan_mode">
+          <option value="0">progressive</option>
+          <option value="1">interlaced</option>
+        </select></label>
+      <label>行地址 row-address-type<span class="tag">0–4，64×64 常用 1</span>
+        <input id="row_address_type" type="number" min="0" max="4"></label>
+      <label>复用 multiplexing<span class="tag">0=直驱，2=1:8 checker</span>
+        <input id="multiplexing" type="number" min="0" max="16"></label>
+      <label>限刷 limit-refresh-hz<span class="tag">0 = 不限</span>
+        <input id="limit_refresh_hz" type="number" min="0" max="240"></label>
+      <label>Pi 5 后端
+        <select id="rp1_pio">
+          <option value="1">RP1 PIO（省 CPU）</option>
+          <option value="0">RP1 RIO</option>
+        </select></label>
+      <label>像素映射 pixel-mapper<span class="tag">如 Rotate:90</span>
+        <input id="pixel_mapper" type="text" placeholder="留空 = 无"></label>
+      <label class="check"><input id="no_hardware_pulse" type="checkbox"> 禁用硬件脉冲</label>
+      <label class="check"><input id="inverse_colors" type="checkbox"> 反色</label>
+      <label class="check"><input id="no_busy_waiting" type="checkbox"> 限刷时 sleep</label>
+    </div>
+    <div class="hint" style="color:#6e7681;font-size:12px;margin-top:10px">
+      本组参数在面板初始化时读取，保存后需「重启设备」才生效。
+    </div>
+  </section>
+
+  <section>
+    <h2>状态</h2>
+    <div class="meta" id="meta">加载中…</div>
+  </section>
+
+  <div class="row">
+    <button class="primary" id="save">保存设置</button>
+    <button id="reload">重新读取</button>
+    <button class="danger" id="restart">重启设备</button>
+    <span class="status" id="st"></span>
+  </div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const FIELDS = [
+  'rows','cols','chain','parallel','brightness','mapping','rgb_sequence','web_port',
+  'panel_type','gpio_slowdown','pwm_bits','pwm_lsb_ns','pwm_dither','scan_mode',
+  'row_address_type','multiplexing','limit_refresh_hz','rp1_pio','pixel_mapper'
+];
+const CHECKS = ['idle','no_hardware_pulse','inverse_colors','no_busy_waiting'];
+
+function setStatus(msg, cls) {
+  const el = $('st');
+  el.textContent = msg;
+  el.className = 'status' + (cls ? ' ' + cls : '');
+}
+
+function fillForm(s) {
+  for (const f of FIELDS) {
+    const el = $(f);
+    if (!el) continue;
+    if (f === 'brightness') {
+      el.value = s.brightness;
+      $('brightness_val').textContent = s.brightness + '%';
+      continue;
+    }
+    el.value = (s[f] === undefined || s[f] === null) ? '' : s[f];
+  }
+  for (const f of CHECKS) {
+    const el = $(f);
+    if (el) el.checked = !!s[f];
+  }
+}
+
+// 亮度滑杆：拖动即 POST /api/brightness（节流），松手再存一次保证落盘
+let brightTimer = 0;
+function pushBrightness(v, save) {
+  const url = save
+    ? '/api/brightness?brightness=' + v
+    : '/api/brightness?brightness=' + v + '&live=1';
+  fetch(url, { method: 'POST' }).catch(() => {});
+}
+function onBrightnessInput(e) {
+  const v = e.target.value;
+  $('brightness_val').textContent = v + '%';
+  clearTimeout(brightTimer);
+  brightTimer = setTimeout(() => pushBrightness(v, false), 80);
+}
+function onBrightnessChange(e) {
+  clearTimeout(brightTimer);
+  pushBrightness(e.target.value, true);
+}
+$('brightness').addEventListener('input', onBrightnessInput);
+$('brightness').addEventListener('change', onBrightnessChange);
+
+async function load() {
+  try {
+    const r = await fetch('/api/config');
+    const j = await r.json();
+    fillForm(j.settings);
+    const rt = j.runtime;
+    $('meta').innerHTML =
+      '<div>面板逻辑分辨率 <b>' + rt.panel_width + ' × ' + rt.panel_height + '</b>' +
+      ' <span class="pill' + (rt.streaming ? ' on' : '') + '">' +
+      (rt.streaming ? '推流中' : '空闲') + '</span></div>' +
+      '<div>当前亮度 <b>' + rt.brightness_now + '%</b></div>' +
+      '<div>配置文件 <b>' + rt.config_path + '</b></div>';
+  } catch (e) {
+    setStatus('读取失败：' + e, 'err');
+  }
+}
+
+async function save() {
+  const p = new URLSearchParams();
+  for (const f of FIELDS) p.set(f, $(f).value);
+  for (const f of CHECKS) p.set(f, $(f).checked ? '1' : '0');
+  setStatus('保存中…');
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: p.toString()
+    });
+    const j = await r.json();
+    if (j.restart_required) {
+      setStatus('已保存。硬件/几何参数已改，需重启设备生效。', 'warn');
+    } else {
+      setStatus('已保存并生效。', 'ok');
+    }
+    load();
+  } catch (e) {
+    setStatus('保存失败：' + e, 'err');
+  }
+}
+
+async function restart() {
+  if (!confirm('确认重启 rpi-led-webpush？推流会中断。')) return;
+  try {
+    await fetch('/api/restart', { method: 'POST' });
+    setStatus('已请求重启，稍候…', 'warn');
+    setTimeout(() => location.reload(), 3000);
+  } catch (e) {
+    setStatus('重启失败：' + e, 'err');
+  }
+}
+
+$('save').onclick = save;
+$('reload').onclick = load;
+$('restart').onclick = restart;
+load();
+</script>
+</body>
+</html>
+"#;
+
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -382,13 +1113,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <span id="geo">—</span>
     <span id="pg"></span>
     <span id="fps">—</span>
+    <label style="color:#6e7681;font-size:12px;display:flex;align-items:center;gap:6px">
+      亮度
+      <input id="bright" type="range" min="1" max="100" value="60" style="width:110px;vertical-align:middle">
+      <span id="bright_v">60%</span>
+    </label>
     <button id="fs">全屏</button>
+    <a href="/settings" style="color:#58a6ff;text-decoration:none;margin-left:8px">设置</a>
+    <a href="/" style="color:#58a6ff;text-decoration:none;margin-left:12px">投送</a>
   </div>
   <div class="hint">画面即 LED 面板正在显示的内容，随窗口自适应缩放</div>
 <script>
 const c = document.getElementById('c');
 const ctx = c.getContext('2d', { alpha: false });
-let img = null, frames = 0, t0 = performance.now();
+let img = null, frames = 0, t0 = performance.now(), skipped = 0;
 
 function setGeo(w, h) {
   c.width = w; c.height = h;
@@ -396,6 +1134,7 @@ function setGeo(w, h) {
   document.getElementById('geo').textContent = w + ' × ' + h;
   img = ctx.createImageData(w, h);
 }
+setGeo(c.width || 64, c.height || 32);
 
 function connect() {
   const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
@@ -413,7 +1152,7 @@ function connect() {
   ws.onmessage = (ev) => {
     const dv = new DataView(ev.data);
     const w = dv.getUint16(0, true), h = dv.getUint16(2, true);
-    if (c.width !== w || c.height !== h) setGeo(w, h);
+    if (!img || c.width !== w || c.height !== h) setGeo(w, h);
     const src = new Uint8Array(ev.data, 8);
     const d = img.data;
     for (let i = 0, j = 0; i < src.length; i += 3, j += 4) {
@@ -438,6 +1177,29 @@ function toggleFs() {
 }
 document.getElementById('fs').onclick = toggleFs;
 c.onclick = toggleFs;
+
+// 实时亮度
+const bright = document.getElementById('bright');
+const brightV = document.getElementById('bright_v');
+let brightTimer = 0;
+function pushBright(v, save) {
+  fetch('/api/brightness?brightness=' + v, { method: 'POST' }).catch(() => {});
+}
+bright.addEventListener('input', (e) => {
+  brightV.textContent = e.target.value + '%';
+  clearTimeout(brightTimer);
+  brightTimer = setTimeout(() => pushBright(e.target.value), 80);
+});
+bright.addEventListener('change', (e) => {
+  clearTimeout(brightTimer);
+  pushBright(e.target.value, true);
+});
+fetch('/api/brightness').then(r => r.json()).then(j => {
+  if (j.brightness) {
+    bright.value = j.brightness;
+    brightV.textContent = j.brightness + '%';
+  }
+}).catch(() => {});
 </script>
 </body>
 </html>
@@ -480,6 +1242,13 @@ const SENDER_HTML: &str = r#"<!doctype html>
     <span><span id="dot" class="dot"></span><span id="st">连接中…</span></span>
     <span id="geo">—</span>
     <span id="fps">—</span>
+    <label style="color:#6e7681;font-size:12px;display:flex;align-items:center;gap:6px">
+      亮度
+      <input id="bright" type="range" min="1" max="100" value="60" style="width:110px">
+      <span id="bright_v">60%</span>
+    </label>
+    <a href="/view" style="color:#58a6ff;text-decoration:none">预览</a>
+    <a href="/settings" style="color:#58a6ff;text-decoration:none">设置</a>
   </div>
   <div class="row">
     <label class="btn">选择视频文件<input type="file" id="file" accept="video/*"></label>
@@ -600,7 +1369,7 @@ function onVideoFrame() {
 }
 
 // 兜底：若视频帧回调超过 500ms 没触发（典型情况：窗口最小化后浏览器降低了解码优先级），
-// 就用定时器继续发当前画面，避免服务端 2 秒收不到帧而切回状态页。
+// 就用定时器继续发当前画面，避免服务端 5 秒收不到帧而切回空闲呼吸。
 setInterval(() => {
   if (!playing) return;
   if (performance.now() - lastVideoFrameAt > 500) sendOneFrame();
@@ -608,6 +1377,7 @@ setInterval(() => {
 
 // 兜底二：静音 AudioContext。浏览器对后台定时器有限流，但音频回调不受影响，
 // 用它当节拍器可以显著提高最小化/后台时的发送率（约 12fps）。
+// 只在视频帧回调已经停了（lastVideoFrameAt 太旧）时才发，避免正常播放时重复发帧。
 let audioCtx = null;
 function startTicker() {
   if (audioCtx) { audioCtx.resume && audioCtx.resume(); return; }
@@ -617,10 +1387,24 @@ function startTicker() {
     const gain = audioCtx.createGain();
     gain.gain.value = 0;                    // 完全静音，不会出声
     const proc = audioCtx.createScriptProcessor(4096, 1, 1);
-    proc.onaudioprocess = () => { if (playing) sendOneFrame(); };
+    proc.onaudioprocess = () => {
+      if (!playing) return;
+      if (performance.now() - lastVideoFrameAt > 500) sendOneFrame();
+    };
     src.connect(gain); gain.connect(proc); proc.connect(audioCtx.destination);
     src.start();
   } catch (e) { audioCtx = null; }
+}
+
+function stopStream() {
+  if (v.srcObject) {
+    for (const t of v.srcObject.getTracks()) t.stop();
+    v.srcObject = null;
+  }
+  if (v.src && v.src.startsWith('blob:')) {
+    URL.revokeObjectURL(v.src);
+    v.src = '';
+  }
 }
 
 function startFrameCallback() {
@@ -662,7 +1446,7 @@ function tick() {
 document.getElementById('file').onchange = (e) => {
   const f = e.target.files[0];
   if (!f) return;
-  v.srcObject = null;
+  stopStream();
   v.src = URL.createObjectURL(f);
   v.play();
   playing = true;
@@ -684,6 +1468,7 @@ document.getElementById('cam').onclick = async () => {
       video: { width: { ideal: 640 }, height: { ideal: 360 },
                frameRate: { ideal: 15, max: 20 } }
     });
+    stopStream();
     v.srcObject = s;
     await v.play();
     playing = true;
@@ -703,9 +1488,12 @@ document.getElementById('screen').onclick = async () => {
     const s = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 15, max: 30 } }, audio: false
     });
+    stopStream();
     v.srcObject = s;
     s.getVideoTracks()[0].addEventListener('ended', () => {
+      playing = false;
       document.getElementById('st').textContent = '屏幕共享已结束';
+      document.getElementById('play').textContent = '继续';
     });
     await v.play();
     playing = true;
@@ -726,6 +1514,29 @@ fetch('/geo').then(r => r.text()).then(t => {
   const p = t.trim().split(/\s+/).map(Number);
   if (p.length >= 2 && p[0] > 0) setGeo(p[0], p[1]);
 }).catch(() => setGeo(64, 32)).finally(() => { connectPush(); tick(); });
+
+// 实时亮度
+const bright = document.getElementById('bright');
+const brightV = document.getElementById('bright_v');
+let brightTimer = 0;
+function pushBright(v) {
+  fetch('/api/brightness?brightness=' + v, { method: 'POST' }).catch(() => {});
+}
+bright.addEventListener('input', (e) => {
+  brightV.textContent = e.target.value + '%';
+  clearTimeout(brightTimer);
+  brightTimer = setTimeout(() => pushBright(e.target.value), 80);
+});
+bright.addEventListener('change', (e) => {
+  clearTimeout(brightTimer);
+  pushBright(e.target.value);
+});
+fetch('/api/brightness').then(r => r.json()).then(j => {
+  if (j.brightness) {
+    bright.value = j.brightness;
+    brightV.textContent = j.brightness + '%';
+  }
+}).catch(() => {});
 </script>
 </body>
 </html>

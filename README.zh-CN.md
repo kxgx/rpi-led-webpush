@@ -27,9 +27,46 @@ WebSocket 发过来，所以驱动面板的设备几乎不占 CPU。
 |---|---|---|
 | `/` | GET | 投送页（内嵌）：视频文件 / 摄像头 / 共享屏幕，可选适应方式 |
 | `/view` | GET | 实时预览面板此刻显示的内容 |
+| `/settings` | GET | 设备设置页（面板尺寸、亮度、映射等） |
 | `/geo` | GET | 面板逻辑分辨率，如 `64 32` |
+| `/api/config` | GET | 当前设置 + 运行时信息（JSON） |
+| `/api/config` | POST | 修改设置（`application/x-www-form-urlencoded`），自动存盘 |
+| `/api/restart` | POST | 干净退出，交给 supervisor 拉起（改几何后用） |
 | `/push` | WebSocket | 投送方向：二进制帧 `[宽 u16][高 u16][RGB…]`（小端） |
 | `/ws` | WebSocket | 预览方向：同样的帧格式，服务端 → 浏览器 |
+
+## 设置与持久化
+
+设置保存在纯文本 `key=value` 文件里（不引解析库）：
+
+* 路径：`LED_CONFIG` → `/etc/rpi-led-webpush/config` → `./rpi-led-webpush.conf`
+* CLI 参数**只覆盖当次运行**；网页修改的是配置文件。
+* **立即生效**：`brightness`、`idle`。
+* **需重启**（`POST /api/restart`）：尺寸 / 连接方式 / `web_port`，以及下列**硬件驱动**参数。
+
+### 硬件驱动参数
+
+对应 `rpi-rgb-led-matrix` 的初始化选项（等价于 `--led-*`），面板上电时读取：
+
+| 配置项 | CLI | 说明 |
+|---|---|---|
+| `panel_type` | `--panel-type` | `FM6126A` / `FM6127`（空 = 通用） |
+| `gpio_slowdown` | `--gpio-slowdown` | 0..4，花屏时加大 |
+| `pwm_bits` | `--pwm-bits` | 1..11 |
+| `pwm_lsb_ns` | `--pwm-lsb-ns` | 纳秒 |
+| `pwm_dither` | `--pwm-dither` | 0..2 |
+| `scan_mode` | `--scan-mode` | 0 逐行 / 1 隔行 |
+| `row_address_type` | `--row-addr-type` | 0..4 |
+| `multiplexing` | `--multiplexing` | 0 直驱，2 = 1:8 |
+| `no_hardware_pulse` | `--no-hardware-pulse` | OE 不在 GPIO18 |
+| `inverse_colors` | `--inverse` | 反色面板 |
+| `pixel_mapper` | `--pixel-mapper` | 如 `Rotate:90` |
+| `limit_refresh_hz` | `--limit-refresh` | 0 = 不限 |
+| `no_busy_waiting` | `--no-busy-waiting` | 限刷时 sleep |
+| `rp1_pio` | `--rp1-rio` 关闭 | Pi 5：1=PIO（默认），0=RIO |
+
+用 systemd 时建议 `ExecStart` 不带 CLI 参数（见 `contrib/`），这样网页保存的配置就是
+重启后生效的配置。
 
 ## 依赖
 

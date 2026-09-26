@@ -10,7 +10,7 @@
 
 #![allow(non_snake_case)]
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int};
 
 pub const SIGINT: c_int = 2;
 pub const SIGTERM: c_int = 15;
@@ -84,6 +84,7 @@ unsafe extern "C" {
     pub fn led_canvas_clear(canvas: *mut LedCanvas);
     pub fn led_canvas_get_size(canvas: *mut LedCanvas, width: *mut c_int, height: *mut c_int);
     pub fn led_canvas_set_pixels(canvas: *mut LedCanvas, x: c_int, y: c_int, width: c_int, height: c_int, colors: *const Color);
+    pub fn led_matrix_set_brightness(matrix: *mut RGBLedMatrix, brightness: u8);
 
 
     // ---- libc（只声明 signal，不引入 libc crate）----

@@ -1,1 +1,4 @@
 /target
+/rpi-led-webpush.conf
+*.conf
+!contrib/*.conf.example

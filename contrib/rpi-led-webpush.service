@@ -5,10 +5,13 @@ After=multi-user.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/rpi-led-webpush
-ExecStart=/opt/rpi-led-webpush/rpi-led-webpush --mapping regular --rgb-sequence RGB --web-port 8080
+# Settings live in ./rpi-led-webpush.conf (editable at http://<device>:8080/settings).
+# Avoid CLI flags here so the web-saved config is what actually runs after restart.
+ExecStart=/opt/rpi-led-webpush/rpi-led-webpush
 # needs /dev/mem and /dev/pio0
 User=root
-Restart=on-failure
+# always: also restart after a clean exit from POST /api/restart
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
