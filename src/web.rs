@@ -1261,8 +1261,8 @@ const SENDER_HTML: &str = r#"<!doctype html>
     </select>
     <button id="play">暂停</button>
   </div>
-  <div class="hint">投送期间会申请「屏幕常亮」以免息屏中断（浏览器不允许网页在真正切到后台后继续使用摄像头，<br>
-    所以请保持本页面在前台；息屏或切走会暂停投送，回来会自动恢复）。<br>
+  <div class="hint">投送期间会申请「屏幕常亮」以免息屏中断。切入后台后 rVFC/定时器会被浏览器限流，<br>
+    本页用 Worker + 静音音频节拍继续抓帧发送（约 20fps 封顶）；若仍不流畅，请保持页面在前台。<br>
     预览即面板上正在显示的画面（画布就是面板的逻辑分辨率，随链屏/并联屏自动变化）。
     解码和缩放都在你的浏览器里完成，树莓派只接收小尺寸帧，CPU 占用极低。</div>
   <video id="v" muted loop playsinline></video>
@@ -1327,10 +1327,25 @@ document.addEventListener('visibilitychange', () => {
     if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
     lastVideoFrameAt = performance.now();        // 让兜底逻辑立刻恢复正常
     lastProgressAt = performance.now();
+  } else if (playing) {
+    // 切到后台：rAF / rVFC / 普通定时器都会被限流，立刻用保活通道补一帧
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    pumpFrame(true);
   }
 });
 
 // 发送一帧（两条驱动路径共用）
+let lastSendAt = 0;
+function pumpFrame(force) {
+  if (!playing || !ws || ws.readyState !== 1) return false;
+  const now = performance.now();
+  // 后台音频/Worker 节拍比视频帧率高，封顶约 20fps，避免同一帧重复推爆链路
+  if (!force && now - lastSendAt < 50) return false;
+  if (ws.bufferedAmount > 64 * 1024) { skipped++; return false; }
+  if (!sendOneFrame()) return false;
+  lastSendAt = now;
+  return true;
+}
 function sendOneFrame() {
   if (!playing || !ws || ws.readyState !== 1) return false;
   if (ws.bufferedAmount > 64 * 1024) { skipped++; return false; }
@@ -1355,7 +1370,8 @@ function onVideoFrame() {
   if (frameCbActive) v.requestVideoFrameCallback(onVideoFrame);
   const now = performance.now();
   lastVideoFrameAt = now;
-  if (playing && sendOneFrame()) srcFrames++;   // 后台不主动停发（真后台由平台限制，靠背压防堆积）
+  // 前台：rVFC 是主驱动；后台 rVFC 可能仍低频触发，直接发即可
+  if (playing && sendOneFrame()) srcFrames++;
   if (now - srcT0 > 1000) {
     srcFps = srcFrames * 1000 / (now - srcT0);
     srcFrames = 0; srcT0 = now;
@@ -1368,31 +1384,49 @@ function onVideoFrame() {
   }
 }
 
-// 兜底：若视频帧回调超过 500ms 没触发（典型情况：窗口最小化后浏览器降低了解码优先级），
-// 就用定时器继续发当前画面，避免服务端 5 秒收不到帧而切回空闲呼吸。
+// 后台是否需要保活通道主动发帧：rVFC 已停，或整页被隐藏。
+function backgroundDrive() {
+  return playing && (document.hidden || performance.now() - lastVideoFrameAt > 400);
+}
+
+// 兜底一：主线程定时器。后台会被限流到约 1Hz，只作最后防线。
 setInterval(() => {
-  if (!playing) return;
-  if (performance.now() - lastVideoFrameAt > 500) sendOneFrame();
+  if (backgroundDrive()) pumpFrame(false);
 }, 100);
 
-// 兜底二：静音 AudioContext。浏览器对后台定时器有限流，但音频回调不受影响，
-// 用它当节拍器可以显著提高最小化/后台时的发送率（约 12fps）。
-// 只在视频帧回调已经停了（lastVideoFrameAt 太旧）时才发，避免正常播放时重复发帧。
+// 兜底二：Worker 定时器。后台限流比主线程轻，是丢帧的主要补手。
+let bgWorker = null;
+function startWorkerTicker() {
+  if (bgWorker) return;
+  try {
+    const src = `let t=null;onmessage=e=>{if(e.data==='run'){clearInterval(t);t=setInterval(()=>postMessage(1),50)}else{clearInterval(t)}}`;
+    bgWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    bgWorker.onmessage = () => { if (backgroundDrive()) pumpFrame(false); };
+    bgWorker.postMessage('run');
+  } catch (e) { bgWorker = null; }
+}
+
+// 兜底三：AudioContext 节拍器。音频回调在后台通常不被限流，是最靠谱的一路。
+// 注意：gain 不能是 0，部分浏览器会把「完全静音」的图收掉、不再回调；用 1e-12 的
+// 不可闻振荡器保活。buffer 取 1024（约 43Hz），够驱动 20fps 的封顶。
 let audioCtx = null;
 function startTicker() {
-  if (audioCtx) { audioCtx.resume && audioCtx.resume(); return; }
+  startWorkerTicker();
+  if (audioCtx) {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    return;
+  }
   try {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = audioCtx.createConstantSource();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AC();
+    const osc = audioCtx.createOscillator();
+    osc.frequency.value = 440;
     const gain = audioCtx.createGain();
-    gain.gain.value = 0;                    // 完全静音，不会出声
-    const proc = audioCtx.createScriptProcessor(4096, 1, 1);
-    proc.onaudioprocess = () => {
-      if (!playing) return;
-      if (performance.now() - lastVideoFrameAt > 500) sendOneFrame();
-    };
-    src.connect(gain); gain.connect(proc); proc.connect(audioCtx.destination);
-    src.start();
+    gain.gain.value = 1e-12;                   // 听不见，但管线保持 active
+    const proc = audioCtx.createScriptProcessor(1024, 1, 1);
+    proc.onaudioprocess = () => { if (backgroundDrive()) pumpFrame(false); };
+    osc.connect(gain); gain.connect(proc); proc.connect(audioCtx.destination);
+    osc.start();
   } catch (e) { audioCtx = null; }
 }
 
