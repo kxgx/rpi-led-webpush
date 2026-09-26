@@ -94,6 +94,8 @@ web-saved config is what restarts with.
 
 ```bash
 cargo build --release
+# or produce a .deb
+./deploy/build-deb.sh dist
 ```
 
 ## Run

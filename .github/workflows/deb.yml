@@ -1,0 +1,151 @@
+name: deb 构建与发布
+
+on:
+  push:
+    branches: [main, deb-packaging]
+    tags: ['v*']
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+  pull_request:
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小权限：默认只读，发布 job 单独开 write
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.codechange.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: 检测代码变更（仅文档变更时跳过；打包脚本/工作流变更也会构建）
+        id: codechange
+        run: |
+          BASE=main
+          if [ "${{ github.event_name }}" = "pull_request" ]; then BASE="${{ github.base_ref }}"; fi
+          git fetch --no-tags origin "$BASE" 2>/dev/null || true
+          if ! git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 应用代码变更 → 必须编
+          if git diff --name-only "origin/$BASE...HEAD" -- . \
+            ':(exclude)*.md' ':(exclude)**/*.md' \
+            ':(exclude).gitignore' ':(exclude)LICENSE' > /tmp/changed.txt 2>/dev/null; then
+            if [ -s /tmp/changed.txt ]; then
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              echo "changed (incl. packaging):"; cat /tmp/changed.txt
+              exit 0
+            fi
+          fi
+          # 纯文档变更：跳过
+          echo "code=false" >> "$GITHUB_OUTPUT"
+          echo "docs-only change — skip deb matrix"
+      - name: 校验打包脚本与版本一致性
+        run: |
+          test -x deploy/build-deb.sh
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "Cargo.toml version=$CARGO_VER"
+          # 脚本必须使用 dpkg-deb（参考 remilia_pet_qt 约束）
+          grep -q 'dpkg-deb --build' deploy/build-deb.sh
+          # 服务安装到 lib/systemd/system
+          grep -q 'lib/systemd/system' deploy/build-deb.sh
+          echo OK
+
+  deb-arm64:
+    name: Linux ARM64 deb
+    needs: [checks]
+    if: needs.checks.outputs.code == 'true' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - name: 安装构建工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential dpkg-dev
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 构建 .deb
+        run: deploy/build-deb.sh dist
+      - name: 上传构件
+        uses: actions/upload-artifact@v6
+        with:
+          name: rpi-led-webpush-linux-arm64-deb
+          path: dist/*.deb
+
+  # 树莓派只需 ARM64；x86 包无硬件可跑，不在此矩阵中构建。
+
+  release:
+    name: 发布
+    needs: [deb-arm64]
+    # 仅官方仓库 tag 触发，防误发布（同 remilia_pet_qt）
+    if: github.repository == 'kxgx/rpi-led-webpush' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: rpi-led-webpush-**
+          merge-multiple: true
+      - name: 列出构件
+        run: ls -la
+      - name: 生成校验和与变更摘要
+        run: |
+          echo "Build: ${{ github.ref_name }}" > sums.txt
+          sha256sum rpi-led-webpush-*.deb >> sums.txt
+          CHANGES=$(git log --abbrev=8 --abbrev-commit --pretty=format:" - %s(%h) by %an" -15)
+          { echo "## 最近变更:"; echo "$CHANGES"; } > changelog.txt
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            rpi-led-webpush-*.deb
+            sums.txt
+            changelog.txt
+          draft: false
+          prerelease: false
+          make_latest: true
+
+  ci-passed:
+    name: 构建门禁
+    needs: [checks, deb-arm64]
+    if: always() && github.repository == 'kxgx/rpi-led-webpush'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 校验结果
+        run: |
+          FAIL=0
+          for r in ${{ needs.deb-arm64.result }}; do
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then FAIL=1; fi
+          done
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY_EOF
+          ## deb 构建摘要
+
+          | 项目 | 结果 |
+          |------|------|
+          | 变更检测 | ${{ needs.checks.result }} |
+          | ARM64 deb | ${{ needs.deb-arm64.result }} |
+          SUMMARY_EOF
+          if [ "$FAIL" = "1" ]; then echo "❌ 存在失败平台"; exit 1; fi
+          echo "✅ 门禁通过"
