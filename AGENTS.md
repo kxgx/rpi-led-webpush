@@ -306,6 +306,15 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 - **CI**（`.github/workflows/deb.yml`）：push `main`/`deb-packaging` 或 tag `v*` 触发；
   arm64 runner 构建 deb 上传 artifact；tag 构建成功后创建 GitHub Release
   （仓库是 `kxgx/rpi-led-webpush` 才执行 release job）；仅文档变更会跳过构建。
+  版本唯一来源是 `Cargo.toml`（工作流不写死版本）：checks job 在 tag 构建时校验
+  `vX.Y.Z` 与 `Cargo.toml` 版本一致，deb-arm64 job 构建后校验产物文件名包含该版本；
+  发版时忘记改 `Cargo.toml` 会让 CI 直接失败，而不是静默打出错版本的 deb。
+- **CI 工具版本**：action 用**浮动 major 标签**（当前 `actions/checkout@v7`、
+  `actions/upload-artifact@v7`、`actions/download-artifact@v8`；
+  `Swatinem/rust-cache@v2`、`softprops/action-gh-release@v3` 同样自动跟最新 2.x/3.x；
+  `dtolnay/rust-toolchain@stable` 每次取最新 stable Rust）。升级 action major 前先看
+  对应 release notes 的 breaking changes，并同步更新本节；runner 保持 LTS
+  （`ubuntu-24.04` 的 x64 / arm64 版本，暂不追新）。
 - **发布流程**：
   1. 改 `Cargo.toml` 版本号为 `x.y.z`；
   2. commit `release: vX.Y.Z`（body 简述本版改动）；
