@@ -21,6 +21,8 @@ pub struct Config {
     pub mapping: String,
     pub rgb_sequence: String,
     pub web_port: u16,
+    /// 网页服务绑定地址；空 = 自动（HTTPS 开启时 127.0.0.1，否则 0.0.0.0）
+    pub web_host: String,
     pub idle: bool,
     /// 无投送时显示时钟/日期（默认开）
     pub show_clock: bool,
@@ -79,6 +81,7 @@ impl Default for Config {
             mapping: "regular".to_string(),
             rgb_sequence: "RGB".to_string(),
             web_port: 8080,
+            web_host: String::new(),
             idle: true,
             show_clock: true,
             clock_24h: true,
@@ -124,6 +127,7 @@ impl Config {
             "mapping" => self.mapping = v.to_string(),
             "rgb_sequence" => self.rgb_sequence = v.to_string(),
             "web_port" => self.web_port = v.parse().unwrap_or(self.web_port),
+            "web_host" => self.web_host = v.to_string(),
             "idle" => self.idle = matches!(v, "1" | "true" | "yes" | "on"),
             "show_clock" => self.show_clock = matches!(v, "1" | "true" | "yes" | "on"),
             "clock_24h" => self.clock_24h = matches!(v, "1" | "true" | "yes" | "on"),
@@ -191,6 +195,11 @@ impl Config {
         }
         self.https_cert = self.https_cert.trim().to_string();
         self.https_key = self.https_key.trim().to_string();
+        // 绑定地址：只接受简单主机名/IP，空白或含空白/控制字符时回落到自动
+        self.web_host = self.web_host.trim().to_string();
+        if self.web_host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            self.web_host.clear();
+        }
         // panel_type 统一成库认识的大小写风格
         self.panel_type = match self.panel_type.trim().to_ascii_lowercase().as_str() {
             "" => String::new(),
@@ -210,6 +219,7 @@ impl Config {
             && self.mapping == other.mapping
             && self.rgb_sequence == other.rgb_sequence
             && self.web_port == other.web_port
+            && self.web_host == other.web_host
             && self.https == other.https
             && self.https_port == other.https_port
             && self.https_cert == other.https_cert
@@ -304,7 +314,7 @@ fn write_config(path: &Path, c: &Config) -> std::io::Result<()> {
         "# rpi-led-webpush configuration\n\
          rows={}\ncols={}\nchain={}\nparallel={}\n\
          brightness={}\nmapping={}\nrgb_sequence={}\n\
-         web_port={}\nidle={}\n\
+         web_port={}\nweb_host={}\nidle={}\n\
          show_clock={}\nclock_24h={}\n\
          lang={}\n\
          \n# ---- HTTPS (socat TLS front-end; needs socat + openssl) ----\n\
@@ -335,6 +345,7 @@ fn write_config(path: &Path, c: &Config) -> std::io::Result<()> {
         c.mapping,
         c.rgb_sequence,
         c.web_port,
+        c.web_host,
         if c.idle { 1 } else { 0 },
         if c.show_clock { 1 } else { 0 },
         if c.clock_24h { 1 } else { 0 },
@@ -377,6 +388,7 @@ impl Config {
             ("mapping", self.mapping.clone()),
             ("rgb_sequence", self.rgb_sequence.clone()),
             ("web_port", self.web_port.to_string()),
+            ("web_host", self.web_host.clone()),
             ("idle", b(self.idle).to_string()),
             ("show_clock", b(self.show_clock).to_string()),
             ("clock_24h", b(self.clock_24h).to_string()),
@@ -559,6 +571,7 @@ mod tests {
         c.parse_line("https=1");
         c.parse_line("https_port=443");
         c.parse_line("https_cert=/etc/ssl/led/cert.pem");
+        c.parse_line("web_host=127.0.0.1");
         c.normalize();
         assert_eq!(c.rows, 64);
         assert!(!c.idle);
@@ -567,6 +580,7 @@ mod tests {
         assert!(c.https);
         assert_eq!(c.https_port, 443);
         assert_eq!(c.https_cert, "/etc/ssl/led/cert.pem");
+        assert_eq!(c.web_host, "127.0.0.1");
     }
 
     #[test]
@@ -600,6 +614,7 @@ mod tests {
         c.https_port = 9443;
         c.https_cert = "/tmp/panel.crt".into();
         c.https_key = "/tmp/panel.key".into();
+        c.web_host = "127.0.0.1".into();
         write_config(&path, &c).unwrap();
         let loaded = load(&path);
         assert_eq!(loaded, c);
@@ -622,6 +637,10 @@ mod tests {
         let mut tls = sc.get();
         tls.https = true;
         assert_eq!(sc.update(tls), ApplyOutcome::NeedsRestart);
+        // 绑定地址变化也要重启（网络监听）
+        let mut host = sc.get();
+        host.web_host = "127.0.0.1".into();
+        assert_eq!(sc.update(host), ApplyOutcome::NeedsRestart);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

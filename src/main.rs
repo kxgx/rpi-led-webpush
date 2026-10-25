@@ -58,6 +58,7 @@ fn apply_cli(c: &mut config::Config) {
             "--parallel" => if let Some(v) = take_value(&argv, &mut i) { c.parallel = v.parse().unwrap_or(c.parallel) },
             "--brightness" => if let Some(v) = take_value(&argv, &mut i) { c.brightness = v.parse().unwrap_or(c.brightness) },
             "--web-port" => if let Some(v) = take_value(&argv, &mut i) { c.web_port = v.parse().unwrap_or(c.web_port) },
+            "--web-host" => if let Some(v) = take_value(&argv, &mut i) { c.web_host = v },
             "--https" => c.https = true,
             "--no-https" => c.https = false,
             "--https-port" => if let Some(v) = take_value(&argv, &mut i) { c.https_port = v.parse().unwrap_or(c.https_port) },
@@ -88,7 +89,8 @@ fn apply_cli(c: &mut config::Config) {
                 println!("  panel:  --rows --cols --chain --parallel --brightness --no-idle");
                 println!("          --no-clock --clock-12h");
                 println!("  wiring: --mapping NAME --rgb-sequence RGB");
-                println!("  web:    --web-port 8080 --https --https-port 8443");
+                println!("  web:    --web-port 8080 --web-host ADDR --https --https-port 8443");
+                println!("          (web-host empty = auto: 127.0.0.1 when HTTPS is on, else 0.0.0.0)");
                 println!("          --https-cert FILE --https-key FILE   (socat TLS front-end)");
                 println!("  driver: --panel-type TYPE   (FM6126A / FM6127, empty = generic)");
                 println!("          --gpio-slowdown 0..4 --pwm-bits 1..11 --pwm-lsb-ns NS");
@@ -270,7 +272,15 @@ fn main() {
     ctl.https_enabled.store(args.https, Ordering::SeqCst);
     ctl.https_port.store(args.https_port as i32, Ordering::SeqCst);
     if args.web_port > 0 {
+        // 绑定地址：空 = 自动（HTTPS 开启时只监听 127.0.0.1，交给 socat 反代；
+        // 否则监听 0.0.0.0）。避免 HTTPS 与明文 HTTP 双开暴露到局域网。
+        let bind_host = if args.web_host.trim().is_empty() {
+            if args.https { "127.0.0.1".to_string() } else { "0.0.0.0".to_string() }
+        } else {
+            args.web_host.clone()
+        };
         web::spawn_web_server(
+            &bind_host,
             args.web_port,
             Arc::clone(&mirror),
             Arc::clone(&stream),
@@ -279,9 +289,14 @@ fn main() {
             shared_cfg.clone(),
             Arc::clone(&ctl),
         );
-        println!("sender page : http://<device>:{}/", args.web_port);
-        println!("panel preview: http://<device>:{}/view", args.web_port);
-        println!("settings page: http://<device>:{}/settings", args.web_port);
+        println!("web bind    : {bind_host}:{}", args.web_port);
+        if bind_host == "127.0.0.1" || bind_host == "::1" {
+            println!("              (仅本机；局域网请走 HTTPS {})", args.https_port);
+        } else {
+            println!("sender page : http://<device>:{}/", args.web_port);
+            println!("panel preview: http://<device>:{}/view", args.web_port);
+            println!("settings page: http://<device>:{}/settings", args.web_port);
+        }
     }
     // 内置 HTTPS：用系统 socat 做 TLS 终止，反代到本机 HTTP 端口（需要 socat + openssl）。
     // 前端进程跟随本进程生命周期：Drop 里 kill，PDEATHSIG 兜底崩溃/被 kill 的情况。

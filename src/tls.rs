@@ -20,6 +20,8 @@ pub struct Plan {
     pub http_port: u16,
     pub cert: PathBuf,
     pub key: PathBuf,
+    /// 证书/私钥允许写在哪个目录下（强制白名单，防止网页把路径改成任意文件）
+    pub tls_dir: PathBuf,
 }
 
 /// 由配置计算 HTTPS 前端参数；只做校验和路径计算，不碰文件系统。
@@ -37,11 +39,13 @@ pub fn plan(cfg: &Config, config_path: &Path) -> Result<Plan, String> {
         ));
     }
     let dir = config_dir(config_path);
+    let tls_dir = dir.join("tls");
     Ok(Plan {
         https_port: cfg.https_port,
         http_port: cfg.web_port,
-        cert: resolve_path(&cfg.https_cert, &dir, "cert.pem"),
-        key: resolve_path(&cfg.https_key, &dir, "key.pem"),
+        cert: resolve_https_path(&cfg.https_cert, &tls_dir, "cert.pem")?,
+        key: resolve_https_path(&cfg.https_key, &tls_dir, "key.pem")?,
+        tls_dir,
     })
 }
 
@@ -52,18 +56,78 @@ fn config_dir(config_path: &Path) -> PathBuf {
     }
 }
 
-/// 空值 → `<配置目录>/tls/<name>`；相对路径按配置目录解析，绝对路径原样使用。
-fn resolve_path(value: &str, dir: &Path, file_name: &str) -> PathBuf {
-    let value = value.trim();
-    if value.is_empty() {
-        return dir.join("tls").join(file_name);
+/// 词法规范化路径（不访问文件系统）。
+fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out.file_name().is_some() {
+                    out.pop();
+                }
+            }
+            Component::Normal(s) => out.push(s),
+        }
     }
-    let p = PathBuf::from(value);
+    out
+}
+
+fn absolute_lexical(p: &Path) -> PathBuf {
     if p.is_absolute() {
+        lexical_normalize(p)
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        lexical_normalize(&cwd.join(p))
+    }
+}
+
+/// `target` 是否位于 `base` 目录内（尽量 canonicalize 解析符号链接后再比）。
+fn path_within(target: &Path, base: &Path) -> bool {
+    let t = absolute_lexical(target);
+    let b = absolute_lexical(base);
+    if t.file_name().is_none() {
+        return false;
+    }
+    if t.starts_with(&b) {
+        return true;
+    }
+    // 配置目录本身可能是符号链接（如 /etc → /private/etc）：再按真实路径比一次
+    let b_real = std::fs::canonicalize(&b).unwrap_or_else(|_| b.clone());
+    let t_parent = t.parent().unwrap_or(Path::new(""));
+    let t_parent_real =
+        std::fs::canonicalize(t_parent).unwrap_or_else(|_| t_parent.to_path_buf());
+    t_parent_real == b_real || t_parent_real.starts_with(&b_real)
+}
+
+/// 证书/私钥路径解析：空 → `<配置目录>/tls/<name>`；其余必须落在 tls 目录内。
+/// 拒绝逗号/控制字符（会破坏 socat 的地址参数）和目录逃逸。
+fn resolve_https_path(value: &str, tls_dir: &Path, default_name: &str) -> Result<PathBuf, String> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return Ok(tls_dir.join(default_name));
+    }
+    if raw.contains(',') || raw.chars().any(|c| c.is_control()) {
+        return Err("证书/私钥路径不能包含逗号或控制字符".to_string());
+    }
+    let p = PathBuf::from(raw);
+    let abs = if p.is_absolute() {
         p
     } else {
-        dir.join(p)
+        tls_dir.join(&p)
+    };
+    let normalized = absolute_lexical(&abs);
+    if !path_within(&normalized, tls_dir) {
+        return Err(format!(
+            "证书/私钥路径必须位于 {} 目录内（当前：{}）",
+            tls_dir.display(),
+            normalized.display()
+        ));
     }
+    Ok(normalized)
 }
 
 /// `socat` 的参数：TLS 监听 + 转发到本机 HTTP 端口。
@@ -79,7 +143,7 @@ pub fn socat_args(p: &Plan) -> Vec<String> {
     ]
 }
 
-/// `openssl req ...` 的参数（生成自签名证书，3650 天有效）。
+/// `openssl req ...` 的参数（生成自签名证书，825 天有效——缩短私钥泄露的影响期）。
 pub fn openssl_args(p: &Plan) -> Vec<String> {
     vec![
         "req".to_string(),
@@ -88,7 +152,7 @@ pub fn openssl_args(p: &Plan) -> Vec<String> {
         "rsa:2048".to_string(),
         "-nodes".to_string(),
         "-days".to_string(),
-        "3650".to_string(),
+        "825".to_string(),
         "-keyout".to_string(),
         p.key.display().to_string(),
         "-out".to_string(),
@@ -96,6 +160,51 @@ pub fn openssl_args(p: &Plan) -> Vec<String> {
         "-subj".to_string(),
         "/CN=rpi-led-webpush".to_string(),
     ]
+}
+
+/// 证书 SAN：本机 hostname（及 .local 名）+ 可探测到的局域网 IP。
+/// 没有 SAN 时现代浏览器即使信任该证书也会报名称不匹配。
+#[cfg(unix)]
+fn san_args() -> Vec<String> {
+    let mut names: Vec<String> = vec!["localhost".to_string()];
+    if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
+        let h = h.trim();
+        let ok = !h.is_empty()
+            && h.len() <= 63
+            && h.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+        if ok {
+            names.push(h.to_string());
+            if !h.contains('.') {
+                names.push(format!("{h}.local"));
+            }
+        }
+    }
+    let mut san = format!(
+        "subjectAltName={}",
+        names
+            .iter()
+            .map(|n| format!("DNS:{n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if let Some(ip) = local_ip() {
+        san.push_str(&format!(",IP:{ip}"));
+    }
+    vec!["-addext".to_string(), san]
+}
+
+/// 探测本机对外 IP（UDP connect 不实际发包，只看本地路由选出的地址）。
+#[cfg(unix)]
+fn local_ip() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 // ---------------------------------------------------------------- Linux 进程
@@ -131,10 +240,40 @@ impl Drop for TlsFrontEnd {
     }
 }
 
+/// 设置文件权限（unix）。
+#[cfg(unix)]
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
 /// 确保证书存在；不存在则用 openssl 生成一张自签名证书。
+///
+/// 安全约束：`plan()` 已限制路径必须位于 `<配置目录>/tls/`；这里再检查目标是
+/// 普通文件（拒绝符号链接/块设备/字符设备），避免被指向 `/etc/passwd`、
+/// `/dev/mmcblk0` 之类的位置。
 #[cfg(unix)]
 fn ensure_cert(p: &Plan) -> Result<(), String> {
+    for f in [&p.cert, &p.key] {
+        match std::fs::symlink_metadata(f) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "证书/私钥路径是符号链接，拒绝写入：{}",
+                    f.display()
+                ));
+            }
+            Ok(meta) if !meta.is_file() => {
+                return Err(format!(
+                    "证书/私钥路径不是普通文件，拒绝写入：{}",
+                    f.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
     if p.cert.is_file() && p.key.is_file() {
+        chmod(&p.key, 0o600);
         return Ok(());
     }
     for f in [&p.cert, &p.key] {
@@ -143,12 +282,16 @@ fn ensure_cert(p: &Plan) -> Result<(), String> {
                 .map_err(|e| format!("无法创建证书目录 {}：{e}", dir.display()))?;
         }
     }
+    let _ = std::fs::create_dir_all(&p.tls_dir);
+    chmod(&p.tls_dir, 0o700);
     println!(
         "https: 证书不存在，正在生成自签名证书 {}（浏览器首次访问需手动信任）",
         p.cert.display()
     );
+    let mut args = openssl_args(p);
+    args.extend(san_args());
     let out = std::process::Command::new("openssl")
-        .args(openssl_args(p))
+        .args(args)
         .output()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -161,10 +304,7 @@ fn ensure_cert(p: &Plan) -> Result<(), String> {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("openssl 生成证书失败：{}", err.trim()));
     }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p.key, std::fs::Permissions::from_mode(0o600));
-    }
+    chmod(&p.key, 0o600);
     Ok(())
 }
 
@@ -229,37 +369,53 @@ mod tests {
         let p = plan(&c, Path::new("/etc/rpi-led-webpush/config")).unwrap();
         assert_eq!(p.https_port, DEFAULT_HTTPS_PORT);
         assert_eq!(p.http_port, c.web_port);
+        assert_eq!(p.tls_dir, PathBuf::from("/etc/rpi-led-webpush/tls"));
         assert_eq!(p.cert, PathBuf::from("/etc/rpi-led-webpush/tls/cert.pem"));
         assert_eq!(p.key, PathBuf::from("/etc/rpi-led-webpush/tls/key.pem"));
     }
 
     #[test]
     fn plan_honours_explicit_ports_and_cert_paths() {
+        // 用临时目录拼路径，避免 Windows / Linux 绝对路径语义差异
+        let dir = std::env::temp_dir().join(format!("lpwp-plan-explicit-{}", std::process::id()));
+        let cfg_path = dir.join("config");
         let mut c = https_cfg();
         c.https_port = 443;
         c.web_port = 9000;
-        c.https_cert = "/certs/panel.pem".into();
-        c.https_key = "keys/panel.key".into(); // 相对路径 → 配置文件目录
-        let p = plan(&c, Path::new("/data/cfg/config")).unwrap();
+        c.https_cert = dir.join("tls").join("panel.pem").to_string_lossy().into_owned();
+        c.https_key = "panel.key".into(); // 相对路径 → tls 目录
+        let p = plan(&c, &cfg_path).unwrap();
         assert_eq!(p.https_port, 443);
         assert_eq!(p.http_port, 9000);
-        assert_eq!(p.cert, PathBuf::from("/certs/panel.pem"));
-        assert_eq!(p.key, PathBuf::from("/data/cfg/keys/panel.key"));
+        assert_eq!(p.cert, dir.join("tls").join("panel.pem"));
+        assert_eq!(p.key, dir.join("tls").join("panel.key"));
     }
 
     #[test]
     fn plan_rejects_invalid_combinations() {
+        let dir = std::env::temp_dir().join(format!("lpwp-plan-reject-{}", std::process::id()));
+        let cfg_path = dir.join("config");
         let mut c = https_cfg();
         c.https = false;
-        assert!(plan(&c, Path::new("/x/config")).is_err(), "未启用时不应启动前端");
+        assert!(plan(&c, &cfg_path).is_err(), "未启用时不应启动前端");
 
         c.https = true;
         c.web_port = 0;
-        assert!(plan(&c, Path::new("/x/config")).is_err(), "web_port=0 没有后端");
+        assert!(plan(&c, &cfg_path).is_err(), "web_port=0 没有后端");
 
         c.web_port = 8080;
         c.https_port = 8080;
-        assert!(plan(&c, Path::new("/x/config")).is_err(), "两个端口相同时应拒绝");
+        assert!(plan(&c, &cfg_path).is_err(), "两个端口相同时应拒绝");
+
+        // 证书/私钥路径白名单：逃出 tls 目录、含逗号都要拒绝
+        c.https_port = 443;
+        c.https_cert = dir.join("outside.pem").to_string_lossy().into_owned();
+        assert!(plan(&c, &cfg_path).is_err(), "绝对路径逃逸必须拒绝");
+        c.https_cert = "../outside.pem".into();
+        assert!(plan(&c, &cfg_path).is_err(), "相对路径逃逸必须拒绝");
+        c.https_cert = String::new();
+        c.https_key = "a,b.pem".into();
+        assert!(plan(&c, &cfg_path).is_err(), "逗号路径必须拒绝");
     }
 
     #[test]
@@ -286,8 +442,9 @@ mod tests {
         let a = openssl_args(&p);
         assert_eq!(a[0], "req");
         assert_eq!(a[1], "-x509");
-        assert_eq!(a[a.len() - 1], "/CN=rpi-led-webpush");
+        assert!(a.contains(&"/CN=rpi-led-webpush".to_string()));
         assert!(a.contains(&"rsa:2048".to_string()));
+        assert!(a.contains(&"825".to_string()), "有效期应缩短到 825 天: {a:?}");
         assert!(a.iter().any(|s| s.ends_with("cert.pem")));
         assert!(a.iter().any(|s| s.ends_with("key.pem")));
     }

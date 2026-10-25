@@ -11,11 +11,27 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::config::{ApplyOutcome, SharedConfig};
+
+/// 单条请求行/头部的最大长度。
+const MAX_LINE: usize = 8 * 1024;
+/// 请求头总字节上限。
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+/// 请求头数量上限。
+const MAX_HEADERS: usize = 100;
+/// 同时处理的连接上限（超过直接 503）。
+const MAX_CONNS: usize = 64;
+/// 请求体上限（配置表单很小）。
+const MAX_BODY: usize = 64 * 1024;
+/// 普通 HTTP 请求的读超时（WebSocket 握手后另行放宽）。
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// 变更类请求必须携带的请求头：跨源表单无法伪造，跨源 fetch 会先触发预检。
+const CSRF_HEADER: &str = "X-Led-Webpush";
 
 pub struct Mirror {
     pub w: usize,
@@ -77,33 +93,128 @@ pub fn new_runtime(brightness: i32, idle: bool) -> SharedRuntime {
     })
 }
 
-/// 启动网页服务（在后台线程里 accept）
-pub fn spawn_web_server(port: u16, mirror: SharedMirror, stream: SharedStream,
+/// 启动网页服务（在后台线程里 accept）。
+pub fn spawn_web_server(host: &str, port: u16, mirror: SharedMirror, stream: SharedStream,
                         geometry: (usize, usize), stop: Arc<AtomicBool>,
                         cfg: SharedConfig, rt: SharedRuntime) {
+    let host = host.to_string();
     thread::spawn(move || {
-        let listener = match TcpListener::bind(("0.0.0.0", port)) {
+        let listener = match TcpListener::bind((host.as_str(), port)) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("网页服务无法监听 0.0.0.0:{port} —— {e}");
+                eprintln!("网页服务无法监听 {host}:{port} —— {e}");
                 return;
             }
         };
-        println!("设置页面: http://<本机IP>:{port}/settings");
+        println!("网页服务: http://{host}:{port}/settings");
+        let active = Arc::new(AtomicUsize::new(0));
         for conn in listener.incoming() {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
             let Ok(conn) = conn else { continue };
+            // 连接数上限：超过直接 503，避免线程/内存耗尽
+            if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+                active.fetch_sub(1, Ordering::SeqCst);
+                let mut c = conn;
+                let _ = write_http(&mut c, "503 Service Unavailable", "text/plain",
+                                   b"too many connections");
+                continue;
+            }
             let m = Arc::clone(&mirror);
             let st = Arc::clone(&stream);
             let cf = cfg.clone();
             let rt = Arc::clone(&rt);
+            let a = Arc::clone(&active);
             thread::spawn(move || {
                 let _ = handle_client(conn, m, st, geometry, cf, rt);
+                a.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
+}
+
+/// 已解析的请求头（只保留安全/路由需要的几个）。
+#[derive(Default)]
+struct ReqHeaders {
+    host: Option<String>,
+    origin: Option<String>,
+    ws_key: Option<String>,
+    ws_version: Option<String>,
+    upgrade_ws: bool,
+    connection_upgrade: bool,
+    x_led: bool,
+    content_length: Option<usize>,
+}
+
+/// 读一行（有长度上限，避免无界内存分配）。
+fn read_line_limited(
+    r: &mut BufReader<TcpStream>,
+    out: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<usize> {
+    out.clear();
+    let mut limited = r.by_ref().take((max + 1) as u64);
+    limited.read_until(b'\n', out)
+}
+
+/// 解析 authority 里的主机名（去掉端口 / IPv6 方括号）。
+fn host_only(authority: &str) -> String {
+    let a = authority.trim();
+    if let Some(rest) = a.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_ascii_lowercase();
+        }
+    }
+    a.split(':').next().unwrap_or(a).trim().to_ascii_lowercase()
+}
+
+/// 从 Origin 头里取出主机名；`null` 等不透明来源返回 None。
+fn origin_host(origin: &str) -> Option<String> {
+    if origin.trim().eq_ignore_ascii_case("null") {
+        return None;
+    }
+    let (_, rest) = origin.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    let h = host_only(authority);
+    if h.is_empty() { None } else { Some(h) }
+}
+
+/// 变更类请求的跨站防护：必须 POST + 自定义头；有 Origin 时其主机必须等于 Host。
+fn mutation_allowed(method: &str, h: &ReqHeaders) -> Result<(), (&'static str, &'static str)> {
+    if method != "POST" {
+        return Err(("405 Method Not Allowed", "只有 POST 可以修改状态"));
+    }
+    if !h.x_led {
+        return Err(("403 Forbidden", "缺少 X-Led-Webpush: 1 请求头（CSRF 保护）"));
+    }
+    if let Some(origin) = &h.origin {
+        let Some(oh) = origin_host(origin) else {
+            return Err(("403 Forbidden", "不透明 Origin 被拒绝"));
+        };
+        let hh = h.host.as_deref().map(host_only).unwrap_or_default();
+        if oh != hh {
+            return Err(("403 Forbidden", "跨源请求被拒绝"));
+        }
+    }
+    Ok(())
+}
+
+/// WebSocket 握手校验：必须有完整的 Upgrade 头；有 Origin 时必须同源。
+fn ws_validate(h: &ReqHeaders) -> Result<(), (&'static str, &'static str)> {
+    if !h.upgrade_ws || !h.connection_upgrade || h.ws_version.as_deref() != Some("13") {
+        return Err(("400 Bad Request", "websocket upgrade required"));
+    }
+    if let Some(origin) = &h.origin {
+        let Some(oh) = origin_host(origin) else {
+            return Err(("403 Forbidden", "不透明 Origin 被拒绝"));
+        };
+        let hh = h.host.as_deref().map(host_only).unwrap_or_default();
+        if oh != hh {
+            return Err(("403 Forbidden", "跨源 WebSocket 被拒绝"));
+        }
+    }
+    Ok(())
 }
 
 fn handle_client(mut s: TcpStream, mirror: SharedMirror, stream: SharedStream,
@@ -111,51 +222,115 @@ fn handle_client(mut s: TcpStream, mirror: SharedMirror, stream: SharedStream,
                  -> std::io::Result<()> {
     let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     s.set_nodelay(true).ok();
-    // 避免对端挂起不发数据时线程永久阻塞（无鉴权端口，恶意/异常客户端都可能来）
-    s.set_read_timeout(Some(std::time::Duration::from_secs(120))).ok();
+    // 请求阶段用短超时，避免恶意客户端慢慢发 header 长期占用线程
+    s.set_read_timeout(Some(HTTP_READ_TIMEOUT)).ok();
     s.set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
     let mut reader = BufReader::new(s.try_clone()?);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() || request_line.trim().is_empty() {
-        let _ = write_http(&mut s, "400 Bad Request", "text/plain", b"bad request");
+
+    // ---- 请求行（有长度上限） ----
+    let mut line = Vec::new();
+    let n = read_line_limited(&mut reader, &mut line, MAX_LINE)?;
+    if n == 0 {
         return Ok(());
     }
+    if n > MAX_LINE {
+        return write_http(&mut s, "414 URI Too Long", "text/plain", b"request line too long");
+    }
+    let request_line = String::from_utf8_lossy(&line);
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_ascii_uppercase();
+    let target = parts.next().unwrap_or("").to_string();
+    if method.is_empty() || target.is_empty() {
+        return write_http(&mut s, "400 Bad Request", "text/plain", b"bad request");
+    }
+    // 日志清洗：去掉控制字符（防 ANSI/日志注入）并截断
+    let log_target: String = target.chars().filter(|c| !c.is_control()).take(200).collect();
+    eprintln!("[http] {peer} {method} {log_target}");
 
-    let mut ws_key: Option<String> = None;
-    let mut content_length: usize = 0;
+    // ---- 请求头（单行/总字节/数量都有上限） ----
+    let mut headers = ReqHeaders::default();
+    let mut header_bytes = 0usize;
+    let mut header_count = 0usize;
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        let mut hline = Vec::new();
+        let n = read_line_limited(&mut reader, &mut hline, MAX_LINE)?;
+        if n == 0 {
             break;
         }
-        let t = line.trim_end();
+        if n > MAX_LINE {
+            return write_http(&mut s, "431 Request Header Fields Too Large", "text/plain",
+                              b"header line too long");
+        }
+        header_bytes += n;
+        header_count += 1;
+        if header_bytes > MAX_HEADER_BYTES || header_count > MAX_HEADERS {
+            return write_http(&mut s, "431 Request Header Fields Too Large", "text/plain",
+                              b"too many headers");
+        }
+        let t = String::from_utf8_lossy(&hline);
+        let t = t.trim_end_matches(['\r', '\n']).trim();
         if t.is_empty() {
             break;
         }
-        if let Some((k, v)) = t.split_once(':') {
-            let (k, v) = (k.trim(), v.trim());
-            if k.eq_ignore_ascii_case("Sec-WebSocket-Key") {
-                ws_key = Some(v.to_string());
-            } else if k.eq_ignore_ascii_case("Content-Length") {
-                content_length = v.parse().unwrap_or(0).min(64 * 1024);
+        let Some((k, v)) = t.split_once(':') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        if k.eq_ignore_ascii_case("Host") {
+            headers.host = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("Origin") {
+            headers.origin = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("Sec-WebSocket-Key") {
+            headers.ws_key = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("Sec-WebSocket-Version") {
+            headers.ws_version = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("Upgrade") {
+            headers.upgrade_ws = v.to_ascii_lowercase().contains("websocket");
+        } else if k.eq_ignore_ascii_case("Connection") {
+            headers.connection_upgrade = v.to_ascii_lowercase().contains("upgrade");
+        } else if k.eq_ignore_ascii_case(CSRF_HEADER) {
+            headers.x_led = v.trim() == "1";
+        } else if k.eq_ignore_ascii_case("Transfer-Encoding") {
+            return write_http(&mut s, "400 Bad Request", "text/plain",
+                              b"transfer-encoding not supported");
+        } else if k.eq_ignore_ascii_case("Content-Length") {
+            match v.parse::<usize>() {
+                Ok(n) if n <= MAX_BODY => match headers.content_length {
+                    Some(old) if old != n => {
+                        return write_http(&mut s, "400 Bad Request", "text/plain",
+                                          b"conflicting content-length");
+                    }
+                    _ => headers.content_length = Some(n),
+                },
+                Ok(_) => return write_http(&mut s, "413 Payload Too Large", "text/plain",
+                                           b"body too large"),
+                Err(_) => return write_http(&mut s, "400 Bad Request", "text/plain",
+                                            b"bad content-length"),
             }
         }
     }
+    // HTTP/1.1 要求 Host；缺失直接 400（否则 Origin/Host 同源校验会失效）
+    if headers.host.is_none() {
+        return write_http(&mut s, "400 Bad Request", "text/plain", b"missing Host header");
+    }
+    // HEAD 不支持：按 HTTP 语义 405 且不发送 body
+    if method == "HEAD" {
+        return write_http(&mut s, "405 Method Not Allowed", "text/plain", b"");
+    }
 
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET").to_ascii_uppercase();
-    let target = parts.next().unwrap_or("/").to_string();
-    eprintln!("[http] {peer} {method} {target}");
     let (path_only, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target.clone(), String::new()),
     };
-    // 读请求体（用于 POST /api/config）
+
+    // ---- 请求体（仅 POST；长度已限制） ----
     let mut body = Vec::new();
-    if content_length > 0 && method != "GET" {
-        body.resize(content_length, 0);
-        if reader.read_exact(&mut body).is_err() {
-            body.clear();
+    if method == "POST" {
+        if let Some(cl) = headers.content_length {
+            if cl > 0 {
+                body.resize(cl, 0);
+                if reader.read_exact(&mut body).is_err() {
+                    return write_http(&mut s, "400 Bad Request", "text/plain", b"short body");
+                }
+            }
         }
     }
 
@@ -168,48 +343,111 @@ fn handle_client(mut s: TcpStream, mirror: SharedMirror, stream: SharedStream,
     };
 
     match path_only.as_str() {
-        "/ws" => match ws_key {
-            Some(key) => ws_stream(s, &key, mirror, leftover),
-            None => write_http(&mut s, "400 Bad Request", "text/plain", b"websocket upgrade required"),
-        },
-        "/push" => match ws_key {
-            Some(key) => ws_receive(s, &key, stream, leftover),
-            None => write_http(&mut s, "400 Bad Request", "text/plain", b"websocket upgrade required"),
-        },
+        "/ws" => {
+            if method != "GET" {
+                return write_http(&mut s, "405 Method Not Allowed", "text/plain", b"GET only");
+            }
+            if let Err((status, msg)) = ws_validate(&headers) {
+                return write_http(&mut s, status, "text/plain", msg.as_bytes());
+            }
+            match headers.ws_key.clone() {
+                Some(key) => {
+                    s.set_read_timeout(None).ok();
+                    ws_stream(s, &key, mirror, leftover)
+                }
+                None => write_http(&mut s, "400 Bad Request", "text/plain",
+                                   b"websocket upgrade required"),
+            }
+        }
+        "/push" => {
+            if method != "GET" {
+                return write_http(&mut s, "405 Method Not Allowed", "text/plain", b"GET only");
+            }
+            if let Err((status, msg)) = ws_validate(&headers) {
+                return write_http(&mut s, status, "text/plain", msg.as_bytes());
+            }
+            match headers.ws_key.clone() {
+                Some(key) => {
+                    // 投送连接可能长时间空闲，握手后放宽读超时
+                    s.set_read_timeout(Some(Duration::from_secs(300))).ok();
+                    ws_receive(s, &key, stream, leftover)
+                }
+                None => write_http(&mut s, "400 Bad Request", "text/plain",
+                                   b"websocket upgrade required"),
+            }
+        }
         "/geo" => {
+            if method != "GET" {
+                return write_http(&mut s, "405 Method Not Allowed", "text/plain", b"GET only");
+            }
             let body = format!("{} {}", geometry.0, geometry.1);
             write_http(&mut s, "200 OK", "text/plain", body.as_bytes())
         }
-        "/api/config" => {
-            if method == "GET" {
+        "/api/config" => match method.as_str() {
+            "GET" => {
                 let json = config_json(&cfg, &rt, &stream, geometry);
                 write_http(&mut s, "200 OK", "application/json; charset=utf-8", json.as_bytes())
-            } else {
-                api_config_set(&mut s, &cfg, &rt, &query, &body)
             }
-        }
+            "POST" => {
+                if let Err((status, msg)) = mutation_allowed(&method, &headers) {
+                    return write_json_err(&mut s, status, msg);
+                }
+                api_config_set(&mut s, &cfg, &rt, &body)
+            }
+            _ => write_http(&mut s, "405 Method Not Allowed", "text/plain", b"GET or POST only"),
+        },
         "/api/restart" => {
+            if let Err((status, msg)) = mutation_allowed(&method, &headers) {
+                return write_json_err(&mut s, status, msg);
+            }
             rt.restart.store(true, Ordering::SeqCst);
             write_http(&mut s, "200 OK", "application/json; charset=utf-8",
                        br#"{"ok":true,"restarting":true}"#)
         }
         // 实时亮度：只动 brightness，不碰其他设置，不触发 restart
-        "/api/brightness" => {
-            if method == "GET" {
+        "/api/brightness" => match method.as_str() {
+            "GET" => {
                 let v = rt.brightness.load(Ordering::Relaxed);
                 let body = format!(r#"{{"brightness":{v}}}"#);
                 write_http(&mut s, "200 OK", "application/json; charset=utf-8", body.as_bytes())
-            } else {
+            }
+            "POST" => {
+                if let Err((status, msg)) = mutation_allowed(&method, &headers) {
+                    return write_json_err(&mut s, status, msg);
+                }
                 api_brightness_set(&mut s, &cfg, &rt, &query, &body)
             }
+            _ => write_http(&mut s, "405 Method Not Allowed", "text/plain", b"GET or POST only"),
+        },
+        "/settings" => {
+            if method != "GET" {
+                return write_http(&mut s, "405 Method Not Allowed", "text/plain", b"GET only");
+            }
+            write_http(&mut s, "200 OK", "text/html; charset=utf-8",
+                       html_lang(SETTINGS_HTML, &rt).as_bytes())
         }
-        "/settings" => write_http(&mut s, "200 OK", "text/html; charset=utf-8",
-                                  html_lang(SETTINGS_HTML, &rt).as_bytes()),
-        "/view" => write_http(&mut s, "200 OK", "text/html; charset=utf-8",
-                              html_lang(INDEX_HTML, &rt).as_bytes()),
-        _ => write_http(&mut s, "200 OK", "text/html; charset=utf-8",
-                        html_lang(SENDER_HTML, &rt).as_bytes()),
+        "/view" => {
+            if method != "GET" {
+                return write_http(&mut s, "405 Method Not Allowed", "text/plain", b"GET only");
+            }
+            write_http(&mut s, "200 OK", "text/html; charset=utf-8",
+                       html_lang(INDEX_HTML, &rt).as_bytes())
+        }
+        "/" => {
+            if method != "GET" {
+                return write_http(&mut s, "405 Method Not Allowed", "text/plain", b"GET only");
+            }
+            write_http(&mut s, "200 OK", "text/html; charset=utf-8",
+                       html_lang(SENDER_HTML, &rt).as_bytes())
+        }
+        _ => write_http(&mut s, "404 Not Found", "text/plain", b"not found"),
     }
+}
+
+/// 变更接口的错误 JSON（带状态码）。
+fn write_json_err(s: &mut TcpStream, status: &str, msg: &str) -> std::io::Result<()> {
+    let body = format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(msg));
+    write_http(s, status, "application/json; charset=utf-8", body.as_bytes())
 }
 
 /// 把页面里的 __LANG__ 换成 zh/en（全局中英切换）。
@@ -240,12 +478,55 @@ mod tests {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.write_all(format!(
             "POST {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+             X-Led-Webpush: 1\r\n\
              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         ).as_bytes()).unwrap();
         let mut buf = String::new();
         s.read_to_string(&mut buf).unwrap();
         buf
+    }
+
+    /// 不带 CSRF 头 / 可指定 Origin 的 POST，用于安全测试。
+    fn post_raw(port: u16, path: &str, body: &str, origin: Option<&str>, with_csrf: bool) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut req = format!("POST {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n");
+        if with_csrf {
+            req.push_str("X-Led-Webpush: 1\r\n");
+        }
+        if let Some(o) = origin {
+            req.push_str(&format!("Origin: {o}\r\n"));
+        }
+        req.push_str(&format!(
+            "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).unwrap();
+        buf
+    }
+
+    /// 发原始请求并只读到响应头结束（用于 WebSocket 101 这类保持连接的响应）。
+    fn raw_headers(port: u16, req: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match s.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
     }
 
     #[test]
@@ -263,7 +544,7 @@ mod tests {
         let stream = new_stream();
         let stop = Arc::new(AtomicBool::new(false));
         let rt = new_runtime(60, true);
-        spawn_web_server(port, mirror, stream, (64, 32), Arc::clone(&stop), cfg.clone(), Arc::clone(&rt));
+        spawn_web_server("127.0.0.1", port, mirror, stream, (64, 32), Arc::clone(&stop), cfg.clone(), Arc::clone(&rt));
         std::thread::sleep(std::time::Duration::from_millis(150));
 
         let settings = get(port, "/settings");
@@ -316,7 +597,7 @@ mod tests {
         drop(listener);
         let stop = Arc::new(AtomicBool::new(false));
         let rt = new_runtime(60, true);
-        spawn_web_server(port, new_mirror(64, 32), new_stream(), (64, 32),
+        spawn_web_server("127.0.0.1", port, new_mirror(64, 32), new_stream(), (64, 32),
                          Arc::clone(&stop), cfg.clone(), Arc::clone(&rt));
         std::thread::sleep(std::time::Duration::from_millis(150));
 
@@ -328,6 +609,107 @@ mod tests {
         // 越界钳制
         let r = post(port, "/api/brightness", "brightness=200");
         assert!(r.contains("\"brightness\":100"), "{r}");
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn security_csrf_methods_and_404() {
+        let dir = std::env::temp_dir().join(format!("lpwp-sec-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("c.conf");
+        let cfg = SharedConfig::open_at(path.clone());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let stop = Arc::new(AtomicBool::new(false));
+        let rt = new_runtime(60, true);
+        spawn_web_server("127.0.0.1", port, new_mirror(64, 32), new_stream(), (64, 32),
+                         Arc::clone(&stop), cfg.clone(), Arc::clone(&rt));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // 未知路径 → 404（不再一律 200）
+        let r = get(port, "/nope");
+        assert!(r.contains("404 Not Found"), "{r}");
+        // 安全响应头
+        assert!(r.contains("X-Content-Type-Options: nosniff"), "{r}");
+        assert!(r.contains("X-Frame-Options: SAMEORIGIN"), "{r}");
+
+        // 变更接口：缺 CSRF 头 → 403；跨源 Origin → 403；同源 Origin → 200
+        let r = post_raw(port, "/api/config", "brightness=50", None, false);
+        assert!(r.contains("403 Forbidden"), "missing csrf header: {r}");
+        let r = post_raw(port, "/api/config", "brightness=50", Some("https://evil.example"), true);
+        assert!(r.contains("403 Forbidden"), "cross-origin: {r}");
+        let r = post_raw(port, "/api/config", "brightness=50", Some("http://t"), true);
+        assert!(r.contains("\"ok\":true"), "same-origin: {r}");
+        assert_eq!(rt.brightness.load(Ordering::SeqCst), 50);
+
+        // query 不再参与配置写入
+        let r = post_raw(port, "/api/config?web_port=0", "brightness=55", Some("http://t"), true);
+        assert!(r.contains("\"ok\":true"), "{r}");
+        let cfg_json = get(port, "/api/config");
+        assert!(cfg_json.contains("\"web_port\":8080"), "query must be ignored: {cfg_json}");
+
+        // /api/restart 只允许 POST，且需要 CSRF 头
+        let r = get(port, "/api/restart");
+        assert!(r.contains("405 Method Not Allowed"), "GET restart: {r}");
+        assert!(!rt.restart.load(Ordering::SeqCst));
+        let r = post_raw(port, "/api/restart", "", None, false);
+        assert!(r.contains("403 Forbidden"), "{r}");
+        assert!(!rt.restart.load(Ordering::SeqCst));
+        let r = post(port, "/api/restart", "");
+        assert!(r.contains("\"ok\":true"), "{r}");
+        assert!(rt.restart.load(Ordering::SeqCst));
+
+        // 缺失 Host → 400（HTTP/1.1 要求）；HEAD / 非法方法 → 405
+        let r = raw_headers(port, "GET / HTTP/1.1\r\n\r\n");
+        assert!(r.contains("400 Bad Request"), "{r}");
+        let r = raw_headers(port, "HEAD / HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(r.contains("405 Method Not Allowed"), "{r}");
+        let r = raw_headers(port, "PUT /api/config HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(r.contains("405 Method Not Allowed"), "{r}");
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn security_ws_origin_and_limits() {
+        let dir = std::env::temp_dir().join(format!("lpwp-secws-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("c.conf");
+        let cfg = SharedConfig::open_at(path.clone());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let stop = Arc::new(AtomicBool::new(false));
+        let rt = new_runtime(60, true);
+        spawn_web_server("127.0.0.1", port, new_mirror(64, 32), new_stream(), (64, 32),
+                         Arc::clone(&stop), cfg.clone(), Arc::clone(&rt));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let handshake = |origin: &str| format!(
+            "GET /push HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Origin: {origin}\r\n\r\n"
+        );
+        // 恶意 Origin 的跨源 WebSocket → 403
+        let r = raw_headers(port, &handshake("https://evil.example"));
+        assert!(r.contains("403 Forbidden"), "cross-origin ws: {r}");
+        // 同源 Origin 可以升级
+        let r = raw_headers(port, &handshake("http://t"));
+        assert!(r.contains("101 Switching Protocols"), "same-origin ws: {r}");
+        // 缺 Upgrade/Connection 头 → 400
+        let r = raw_headers(port, "GET /push HTTP/1.1\r\nHost: t\r\nSec-WebSocket-Key: x\r\n\r\n");
+        assert!(r.contains("400 Bad Request"), "incomplete upgrade: {r}");
+
+        // 超长请求行 → 414，之后服务仍可用
+        let long = "/".to_string() + &"a".repeat(9000);
+        let r = get(port, &long);
+        assert!(r.contains("414 URI Too Long"), "long uri: {}", &r[..r.len().min(80)]);
+        let r = get(port, "/geo");
+        assert!(r.contains("64 32"), "server must stay alive: {r}");
+
         stop.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -399,7 +781,7 @@ fn config_json(cfg: &SharedConfig, rt: &SharedRuntime, stream: &SharedStream,
     format!(
         r#"{{"settings":{{"rows":{rows},"cols":{cols},"chain":{chain},"parallel":{parallel},
         "brightness":{brightness},"mapping":"{mapping}","rgb_sequence":"{rgb_sequence}",
-        "web_port":{web_port},"idle":{idle},
+        "web_port":{web_port},"web_host":"{web_host}","idle":{idle},
         "show_clock":{show_clock},"clock_24h":{clock_24h},"lang":"{lang}",
         "https":{https},"https_port":{https_port},
         "https_cert":"{https_cert}","https_key":"{https_key}",
@@ -421,6 +803,7 @@ fn config_json(cfg: &SharedConfig, rt: &SharedRuntime, stream: &SharedStream,
         mapping = json_escape(&c.mapping),
         rgb_sequence = json_escape(&c.rgb_sequence),
         web_port = c.web_port,
+        web_host = json_escape(&c.web_host),
         idle = c.idle,
         show_clock = c.show_clock,
         clock_24h = c.clock_24h,
@@ -489,9 +872,9 @@ fn api_brightness_set(s: &mut TcpStream, cfg: &SharedConfig, rt: &SharedRuntime,
 }
 
 fn api_config_set(s: &mut TcpStream, cfg: &SharedConfig, rt: &SharedRuntime,
-                  query: &str, body: &[u8]) -> std::io::Result<()> {
-    let mut kvs = parse_kv(query);
-    kvs.extend(parse_kv(&String::from_utf8_lossy(body)));
+                  body: &[u8]) -> std::io::Result<()> {
+    // 只接受请求体里的字段（不接受 query，避免预检/GET 类请求意外改配置）
+    let kvs = parse_kv(&String::from_utf8_lossy(body));
     let mut c = cfg.get();
     for (k, v) in kvs {
         match k.as_str() {
@@ -503,6 +886,7 @@ fn api_config_set(s: &mut TcpStream, cfg: &SharedConfig, rt: &SharedRuntime,
             "mapping" => if !v.is_empty() { c.mapping = v },
             "rgb_sequence" => if !v.is_empty() { c.rgb_sequence = v },
             "web_port" => if let Ok(n) = v.parse() { c.web_port = n },
+            "web_host" => c.web_host = v,
             "idle" => c.idle = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
             "show_clock" => c.show_clock = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
             "clock_24h" => c.clock_24h = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
@@ -578,7 +962,9 @@ fn write_http(
 ) -> std::io::Result<()> {
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
-         Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+         Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: SAMEORIGIN\r\nContent-Security-Policy: frame-ancestors 'self'\r\n\
+         Referrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
         body.len()
     );
     s.write_all(header.as_bytes())?;
@@ -988,6 +1374,8 @@ const SETTINGS_HTML: &str = r#"<!doctype html>
     <div class="grid">
       <label>网页端口 web-port<span class="tag" data-en="0 = no web UI">0 = 关闭网页</span>
         <input id="web_port" type="number" min="0" max="65535"></label>
+      <label>绑定地址 web-host<span class="tag" data-en="empty = auto (127.0.0.1 when HTTPS on)">留空 = 自动（HTTPS 开时仅 127.0.0.1）</span>
+        <input id="web_host" type="text" placeholder="留空 = 自动"></label>
       <label class="check"><input id="https" type="checkbox"> <span data-en="Enable HTTPS">启用 HTTPS</span></label>
       <label>HTTPS 端口<span class="tag" data-en="default 8443">默认 8443</span>
         <input id="https_port" type="number" min="1" max="65535"></label>
@@ -999,7 +1387,9 @@ const SETTINGS_HTML: &str = r#"<!doctype html>
     <div class="hint" style="color:#6e7681;font-size:12px;margin-top:10px"
          data-en="Needs a restart. HTTPS uses the system socat as a TLS terminator (install socat + openssl) and generates a self-signed certificate on first use; plain HTTP on web_port keeps working.">
       本组改完需重启设备。开启 HTTPS 后程序用系统 socat 做 TLS 终止（需要 socat + openssl），首次自动生成自签名证书；
-      之后改用 https://&lt;设备&gt;:端口/ 访问并信任一次证书（摄像头/屏幕共享必须 HTTPS）。原 HTTP 端口仍然可用。
+      之后改用 https://&lt;设备&gt;:端口/ 访问并信任一次证书（摄像头/屏幕共享必须 HTTPS）。
+      开启 HTTPS 时网页服务默认只绑定 127.0.0.1（由 socat 反代）；需要局域网明文 HTTP 访问时，
+      把「绑定地址」填 0.0.0.0 并确认网络可信。
     </div>
   </section>
 
@@ -1061,12 +1451,14 @@ const SETTINGS_HTML: &str = r#"<!doctype html>
 </div>
 <script>
 const L = '__LANG__';
+// 变更类请求必须带这个头（服务端 CSRF 保护）：跨源表单/fetch 无法自动携带
+const H = { 'X-Led-Webpush': '1' };
 const $ = (id) => document.getElementById(id);
 if (L === 'en') {
   document.querySelectorAll('[data-en]').forEach(el => { el.textContent = el.getAttribute('data-en'); });
 }
 const FIELDS = [
-  'rows','cols','chain','parallel','brightness','mapping','rgb_sequence','web_port','lang',
+  'rows','cols','chain','parallel','brightness','mapping','rgb_sequence','web_port','web_host','lang',
   'https_port','https_cert','https_key',
   'panel_type','gpio_slowdown','pwm_bits','pwm_lsb_ns','pwm_dither','scan_mode',
   'row_address_type','multiplexing','limit_refresh_hz','rp1_pio','pixel_mapper'
@@ -1107,7 +1499,7 @@ function pushBrightness(v, save) {
   const url = save
     ? '/api/brightness?brightness=' + v
     : '/api/brightness?brightness=' + v + '&live=1';
-  fetch(url, { method: 'POST' }).catch(() => {});
+  fetch(url, { method: 'POST', headers: H }).catch(() => {});
 }
 function onBrightnessInput(e) {
   const v = e.target.value;
@@ -1140,7 +1532,7 @@ async function load() {
         '</b>' +
         (rt.https_note ? ' <span class="status err">' + esc(rt.https_note) + '</span>' : '') +
       '</div>' +
-      '<div>配置文件 <b>' + rt.config_path + '</b></div>';
+      '<div>配置文件 <b>' + esc(rt.config_path) + '</b></div>';
   } catch (e) {
     setStatus('读取失败：' + e, 'err');
   }
@@ -1154,7 +1546,7 @@ async function save() {
   try {
     const r = await fetch('/api/config', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...H },
       body: p.toString()
     });
     const j = await r.json();
@@ -1178,7 +1570,7 @@ async function save() {
 async function restart() {
   if (!confirm(L==='en' ? 'Restart rpi-led-webpush? Streaming will drop.' : '确认重启 rpi-led-webpush？推流会中断。')) return;
   try {
-    await fetch('/api/restart', { method: 'POST' });
+    await fetch('/api/restart', { method: 'POST', headers: H });
     setStatus('已请求重启，稍候…', 'warn');
     setTimeout(() => location.reload(), 3000);
   } catch (e) {
@@ -1243,6 +1635,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <div class="hint" data-en="What you see is what the panel is showing right now">画面即 LED 面板正在显示的内容，随窗口自适应缩放</div>
 <script>
 const L = '__LANG__';
+// 变更类请求必须带这个头（服务端 CSRF 保护）：跨源表单/fetch 无法自动携带
+const H = { 'X-Led-Webpush': '1' };
 if (L === 'en') {
   document.documentElement.lang = 'en';
   document.querySelectorAll('[data-en]').forEach(el => { el.textContent = el.getAttribute('data-en'); });
@@ -1306,7 +1700,7 @@ const bright = document.getElementById('bright');
 const brightV = document.getElementById('bright_v');
 let brightTimer = 0;
 function pushBright(v, save) {
-  fetch('/api/brightness?brightness=' + v, { method: 'POST' }).catch(() => {});
+  fetch('/api/brightness?brightness=' + v, { method: 'POST', headers: H }).catch(() => {});
 }
 bright.addEventListener('input', (e) => {
   brightV.textContent = e.target.value + '%';
@@ -1392,6 +1786,8 @@ const SENDER_HTML: &str = r#"<!doctype html>
   <video id="v" muted loop playsinline></video>
 <script>
 const L = '__LANG__';
+// 变更类请求必须带这个头（服务端 CSRF 保护）：跨源表单/fetch 无法自动携带
+const H = { 'X-Led-Webpush': '1' };
 if (L === 'en') {
   document.documentElement.lang = 'en';
   document.querySelectorAll('[data-en]').forEach(el => { el.textContent = el.getAttribute('data-en'); });
@@ -1683,7 +2079,7 @@ const bright = document.getElementById('bright');
 const brightV = document.getElementById('bright_v');
 let brightTimer = 0;
 function pushBright(v) {
-  fetch('/api/brightness?brightness=' + v, { method: 'POST' }).catch(() => {});
+  fetch('/api/brightness?brightness=' + v, { method: 'POST', headers: H }).catch(() => {});
 }
 bright.addEventListener('input', (e) => {
   brightV.textContent = e.target.value + '%';

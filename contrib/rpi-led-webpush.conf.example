@@ -16,8 +16,12 @@ mapping=regular
 # Channel order if your panel mixes green/blue etc.
 rgb_sequence=RGB
 
-# Web UI port; 0 disables the web server
+# Web UI port; 0 disables the web server. Read-only pages need no auth; state-changing
+# requests need the X-Led-Webpush: 1 header (tokens/CSRF protection).
 web_port=8080
+
+# Web UI bind address; empty = auto (127.0.0.1 when https=1 via socat, else 0.0.0.0)
+web_host=
 
 # 1 = dim blue breathing while idle (hot-applied)
 idle=1
