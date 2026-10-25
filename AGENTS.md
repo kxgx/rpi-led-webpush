@@ -37,7 +37,7 @@ RGB LED 点阵屏。解码与缩放都在浏览器里完成，只通过 WebSocke
   - **内置 HTTPS 开关**：用系统 `socat` 做 TLS 终止 + `openssl` 首启自签证书（见 §8），
     从 `v0.2.3` 开始提供；
   - deb 打包（arm64）+ tag 触发 CI 自动构建并创建 GitHub Release。
-- 测试规模：**16 个单元测试**（clock 6 / config 4 / tls 4 / web 2），Linux 上 `cargo test` 全绿。
+- 测试规模：**20 个单元测试**（clock 6 / config 8 / tls 4 / web 2），Linux 上 `cargo test` 全绿。
 - 已知未修问题（见 §7）：12 小时制在 64 宽面板会裁字；逻辑宽度 < 46 px 的窄面板会裁掉星期。
 - 未提交改动以 `git status` 为准；本文件若与代码不一致，**以代码为准并顺手修正本文件**。
 
@@ -74,7 +74,7 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 |---|---|---|
 | `src/main.rs` | CLI 解析、面板初始化（FFI options）、主循环（推流帧 → 面板；空闲时钟/呼吸/黑屏）、TLS 前端生命周期、信号处理、多驱动并发检测 `guard()` | 改硬件参数要同步 `ffi.rs` 结构体字段顺序（照抄 C 头文件） |
 | `src/web.rs` | 手写 HTTP/WebSocket/SHA-1/base64；三个内嵌页面；路由与 API；`Mirror`（/view 数据源）、`Stream`（推流帧）、`RuntimeCtl`（热更新控制 + HTTPS 运行状态） | 页面是 raw string；`data-en` 做中英切换；表单 id 必须与 JS 的 `FIELDS`/`CHECKS` 对应 |
-| `src/config.rs` | `key=value` 配置：默认值、解析、`normalize()`、原子写盘、`restart_eq()` 判定热改/重启、`SharedConfig` | 新增配置项要改**多处**（见 §5、§13） |
+| `src/config.rs` | `key=value` 配置：默认值、解析、`normalize()`、**增量写盘**（只改变化键，保留注释/未知键）、`restart_eq()` 判定热改/重启、`SharedConfig` | 新增配置项要改**多处**（见 §5、§13） |
 | `src/clock.rs` | 空闲时钟：5×7 ASCII + 8×8 中文星期字模、绘制、blit | 字模规范与结构测试见 §7 |
 | `src/tls.rs` | 内置 HTTPS：参数校验/路径解析、socat/openssl 命令行、证书自动生成、socat 子进程管理 | 程序本身**不做 TLS**（零依赖约束） |
 | `src/ffi.rs` | librgbmatrix + libc（time/signal）手写 FFI | 结构体字段顺序必须与 `third_party/.../include/led-matrix-c.h` 一致 |
@@ -92,6 +92,13 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 
 **优先级**：CLI 参数 > 配置文件 > 内置默认值。CLI 只覆盖当次运行，**不写盘**；
 网页 `/api/config` POST 会把当前内存配置写盘（原子写：同目录 `.tmp` + rename）。
+
+**写盘是增量的**：`SharedConfig::update()` 先用 `Config::pairs()` 做 `old → new` 差异比较，
+只把**真正变化的键**回写文件。文件里的注释、未知键、键顺序、用户写法（例如用户写
+`idle=true` 不会被改写成 `idle=1`，因为值没变）全部保留；没有变化时完全不碰文件。
+文件不存在时才用带分区注释的完整模板首次生成；文件里没有的新键会追加到末尾
+（`# added by rpi-led-webpush` 标记下）。**新增配置项时必须把 key 加进
+`Config::pairs()`**，否则完整写入/增量写盘都不会包含它。
 
 **生效方式**：
 
@@ -140,7 +147,7 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 `rgb_sequence` 空值回落默认；`lang` 非 `en` 一律 `zh`；`https_port == 0` 回落 8443；
 `https_cert`/`https_key` 去首尾空白；`panel_type` 归一化成库认识的大小写。
 新增键时**必须同步**：结构体字段、`Default`、`parse_line`、`normalize`、
-`write_config`、`restart_eq`、`config_json`、`api_config_set`、设置页、README、
+`write_config`、`pairs()`、`restart_eq`、`config_json`、`api_config_set`、设置页、README、
 `contrib/rpi-led-webpush.conf.example`。
 
 ---
@@ -262,7 +269,7 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 ## 9. 构建、测试与 Windows 开发机注意事项
 
 - **Linux/Pi**：`cargo build --release` 即可；`build.rs` 自动编 vendored 驱动。
-- **测试**：`cargo test`（16 个）。`web.rs` 的测试会在 `127.0.0.1:0` 起真实 HTTP 服务，
+- **测试**：`cargo test`（20 个）。`web.rs` 的测试会在 `127.0.0.1:0` 起真实 HTTP 服务，
   需要允许监听本地 TCP；`config.rs`/`web.rs` 测试会写系统临时目录。
 - **Windows 开发机无法 `cargo build`**（`build.rs` 需要 `g++` 编 C++，且程序依赖 Linux
   的 `/dev/mem`、`/dev/pio0`、`prctl` 等）。可在 Windows 上做的验证：
@@ -348,7 +355,8 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 ## 13. 常见任务 playbook
 
 **加一个配置项**：
-1. `src/config.rs`：结构体字段、`Default`、`parse_line`、`normalize`、`write_config`；
+1. `src/config.rs`：结构体字段、`Default`、`parse_line`、`normalize`、`write_config`、
+   `pairs()`（增量写盘的键表，漏了会导致该键不被写入）；
    需要重启则加进 `restart_eq()`；
 2. `src/web.rs`：`config_json()` 的 `settings` 对象（+ 如要显示运行时状态则 `RuntimeCtl`
    与 `runtime` 对象）、`api_config_set()` 的匹配分支；
