@@ -28,7 +28,7 @@ RGB LED 点阵屏。解码与缩放都在浏览器里完成，只通过 WebSocke
 
 ## 2. 当前状态（维护本节，发版/大改后更新）
 
-- 版本：`Cargo.toml` = **0.2.4**；最近 release commit `release: v0.2.4`，annotated tag `v0.2.4`。
+- 版本：`Cargo.toml` = **0.2.5**；最近 release commit `release: v0.2.5`，annotated tag `v0.2.5`。
 - 已实现功能：
   - 投送：视频文件 / 摄像头 / 屏幕共享，适应方式可选；`/view` 实时预览面板画面；
   - 设置页：面板几何、亮度（热更新）、空闲行为、语言、硬件驱动参数、网络 / HTTPS、
@@ -309,6 +309,10 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
   版本唯一来源是 `Cargo.toml`（工作流不写死版本）：checks job 在 tag 构建时校验
   `vX.Y.Z` 与 `Cargo.toml` 版本一致，deb-arm64 job 构建后校验产物文件名包含该版本；
   发版时忘记改 `Cargo.toml` 会让 CI 直接失败，而不是静默打出错版本的 deb。
+  构建门禁（`ci-passed`）在 Step Summary 用图标展示各阶段结果（✅ 通过 / ❌ 失败 /
+  ⏭️ 跳过 / ⚪ 取消），失败时同时打 `::error::` 注解；判定要求 `checks` 成功、
+  `deb-arm64` 成功或（没代码变更时）跳过——修过「checks 失败但门禁误报通过」的 bug，
+  改判定逻辑时别退回只看 deb-arm64。
 - **CI 工具版本**：action 用**浮动 major 标签**（当前 `actions/checkout@v7`、
   `actions/upload-artifact@v7`、`actions/download-artifact@v8`；
   `Swatinem/rust-cache@v2`、`softprops/action-gh-release@v3` 同样自动跟最新 2.x/3.x；
