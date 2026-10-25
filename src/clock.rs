@@ -85,12 +85,21 @@ fn text_width(s: &str, scale: usize) -> usize {
     s.len() * 6 * scale
 }
 
-/// 8×8 点阵汉字（星期）。每行一字节，bit7 为最左。
-/// 画成「横画感」而不是星形，小尺寸上才认得出。
+/// 8×8 点阵汉字（星期）。每行一字节，bit7 为最左、bit0 为最右；第 0 行最上。
+///
+/// 8×8 只画得下笔画骨架，认字靠的是「笔画位置和长度」，所以：
+/// 横画按汉字比例排（短横居中、长横贯通），竖画按部件分列，第 7 行留空与
+/// 5×7 的日期数字同基线。几个容易画错的字：
+/// * 三：中横最短、底横最长（横画长度反过来就散了）；
+/// * 四：外框里是「儿」的两笔（可带钩），不是一条实心中柱；
+/// * 五：中横下是「竖 + 横折」两笔；只画同列一竖会读成「王」；
+/// * 六：点 + 通栏横画 + 八字脚，不能画成星号。
+///
+/// 改动前先看 `weekday_glyphs_have_correct_strokes` 测试，它锁住了这些结构。
 fn cjk_weekday(wday: u32) -> Option<[u8; 8]> {
     #[rustfmt::skip]
     let g = match wday % 7 {
-        0 => [ // 日 — 一口字加一条中横
+        0 => [ // 日 — 外框 + 一条贯通中横
             0b01111110,
             0b01000010,
             0b01000010,
@@ -100,7 +109,7 @@ fn cjk_weekday(wday: u32) -> Option<[u8; 8]> {
             0b01111110,
             0b00000000,
         ],
-        1 => [ // 一
+        1 => [ // 一 — 一横居中，贯通全宽
             0b00000000,
             0b00000000,
             0b00000000,
@@ -110,54 +119,54 @@ fn cjk_weekday(wday: u32) -> Option<[u8; 8]> {
             0b00000000,
             0b00000000,
         ],
-        2 => [ // 二
+        2 => [ // 二 — 上横短、下横长
+            0b01111110,
+            0b00000000,
+            0b00000000,
+            0b00000000,
+            0b00000000,
+            0b00000000,
+            0b11111111,
+            0b00000000,
+        ],
+        3 => [ // 三 — 中横最短、底横最长
+            0b01111110,
+            0b00000000,
+            0b00000000,
             0b00111100,
             0b00000000,
             0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01111110,
-            0b00000000,
+            0b11111111,
             0b00000000,
         ],
-        3 => [ // 三
-            0b00111100,
-            0b00000000,
-            0b01111110,
-            0b00000000,
-            0b00111100,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-        ],
-        4 => [ // 四 — 外框里两竖
-            0b01111110,
-            0b01000010,
-            0b01011010,
-            0b01011010,
-            0b01011010,
-            0b01011010,
-            0b01111110,
+        4 => [ // 四 — 外框 + 里面「儿」两笔（左右带钩）
+            0b11111111,
+            0b10100101,
+            0b10100101,
+            0b10100111,
+            0b11000001,
+            0b10000001,
+            0b11111111,
             0b00000000,
         ],
-        5 => [ // 五
+        5 => [ // 五 — 上横/竖/中横/横折/底横；中横下是竖 + 横折两笔
             0b01111110,
-            0b00001000,
-            0b00001000,
-            0b00111110,
-            0b00001000,
-            0b00001000,
-            0b01111110,
-            0b00000000,
-        ],
-        6 => [ // 六 — 顶点 + 八字脚，不要画成 *
             0b00010000,
             0b00010000,
-            0b01111110,
+            0b01111100,
+            0b00010100,
+            0b00010100,
+            0b11111111,
+            0b00000000,
+        ],
+        6 => [ // 六 — 斜点 + 通栏横画 + 八字脚
+            0b00010000,
+            0b00001000,
+            0b11111111,
             0b00000000,
             0b00100100,
-            0b00100100,
             0b01000010,
+            0b10000001,
             0b00000000,
         ],
         _ => return None,
@@ -296,5 +305,128 @@ mod tests {
         // 六 不能是对称十字/星形（中心 3×3 不能全是放射点）
         let liu = cjk_weekday(6).unwrap();
         assert_ne!(liu[3], 0b11111111);
+    }
+
+    /// 逐字检查笔画结构。8×8 上能不能认出是哪个字，全靠横画长度次序、外框
+    /// 是否闭合、竖画落在哪一列这些特征；改字形时不要把它们改坏。
+    #[test]
+    fn weekday_glyphs_have_correct_strokes() {
+        fn cols(row: u8) -> Vec<u32> {
+            (0..8u32).filter(|c| row & (0x80 >> c) != 0).collect()
+        }
+        fn width(row: u8) -> u32 {
+            row.count_ones()
+        }
+        fn ink_rows(g: [u8; 8]) -> Vec<u8> {
+            g.iter().copied().filter(|r| *r != 0).collect()
+        }
+
+        // 日：外框闭合 + 一条贯通中横，其余行只有左右两竖
+        let ri = cjk_weekday(0).unwrap();
+        for r in [0usize, 3, 6] {
+            assert_eq!(ri[r], 0b01111110, "日: 第 {r} 行应为贯通横画");
+        }
+        for r in [1usize, 2, 4, 5] {
+            assert_eq!(ri[r] & 0b01000010, 0b01000010, "日: 第 {r} 行应有左右两竖");
+            assert_eq!(ri[r] & 0b00111100, 0, "日: 第 {r} 行中间不应有横画");
+        }
+
+        // 一：只有一横，贯通全宽
+        let yi = ink_rows(cjk_weekday(1).unwrap());
+        assert_eq!(yi.len(), 1, "一: 应该只有一横");
+        assert_eq!(width(yi[0]), 8, "一: 横画应贯通全宽");
+
+        // 二：两横，下横比上横长
+        let er = ink_rows(cjk_weekday(2).unwrap());
+        assert_eq!(er.len(), 2, "二: 应该只有两横");
+        assert!(width(er[1]) > width(er[0]), "二: 下横必须比上横长");
+
+        // 三：三横，中横最短、底横最长（旧字形把中横画成最长，字就散了）
+        let san = ink_rows(cjk_weekday(3).unwrap());
+        assert_eq!(san.len(), 3, "三: 应该只有三横");
+        assert!(width(san[1]) < width(san[0]), "三: 中横应比上横短");
+        assert!(
+            width(san[2]) > width(san[0]) && width(san[2]) > width(san[1]),
+            "三: 底横必须最长"
+        );
+
+        // 四：外框闭合，内部是「儿」两笔（可以带钩），不能糊成一条实心中柱
+        let si = cjk_weekday(4).unwrap();
+        assert_eq!(si[0], 0b11111111, "四: 上横应贯通");
+        assert_eq!(si[6], 0b11111111, "四: 下横应贯通");
+        let mut rows_with_inner = 0;
+        let mut split_found = false;
+        for r in 1..=5usize {
+            assert_eq!(si[r] & 0b10000001, 0b10000001, "四: 第 {r} 行应有左右两竖");
+            let inner = cols(si[r] & 0b01111110); // 去掉边框后的内部笔画
+            if inner.is_empty() {
+                continue;
+            }
+            rows_with_inner += 1;
+            if inner.len() >= 2 && inner[inner.len() - 1] - inner[0] > 1 {
+                split_found = true;
+            }
+        }
+        assert!(rows_with_inner >= 2, "四: 内部应有「儿」两笔，不能是空框");
+        assert!(split_found, "四: 内部两笔必须分开，不能糊成一根实心中柱");
+
+        // 五：三横；中横下必须是「竖 + 横折」两笔（只画同列一竖穿过就读成「王」）
+        let wu = cjk_weekday(5).unwrap();
+        let bars: Vec<usize> = (0..8).filter(|&r| width(wu[r]) >= 5).collect();
+        assert_eq!(bars, vec![0, 3, 6], "五: 应有上/中/底三横");
+        let upper = cols(wu[1]);
+        assert_eq!(upper.len(), 1, "五: 中横以上应只有一竖");
+        let mut lower: Vec<u32> = (4..=5).flat_map(|r| cols(wu[r])).collect();
+        lower.sort_unstable();
+        lower.dedup();
+        assert_eq!(lower.len(), 2, "五: 中横以下应是「竖 + 横折」两笔");
+        assert!(lower.contains(&upper[0]), "五: 竖画应穿过中横继续向下");
+        assert!(
+            lower.iter().any(|&c| c > upper[0]),
+            "五: 横折的竖应在上竖右边，否则读成「王」"
+        );
+
+        // 六：顶点 + 通栏横画 + 八字脚，脚越往下越开
+        let liu = cjk_weekday(6).unwrap();
+        assert_eq!(liu[2].count_ones(), 8, "六: 第 2 行应为贯通全宽的横画");
+        assert_ne!(liu[0] & 0b00011000, 0, "六: 顶点应靠近中线");
+        let spread = |row: u8| {
+            let c = cols(row);
+            assert_eq!(c.len(), 2, "六: 八字脚每行应是两个点");
+            c[1] - c[0]
+        };
+        assert!(spread(liu[6]) > spread(liu[4]), "六: 八字脚应越往下越开");
+    }
+
+    /// 所有星期字形都与 5×7 的日期数字同基线：第 7 行留空，且每字都有笔画。
+    #[test]
+    fn weekday_glyphs_share_baseline() {
+        for d in 0..7u32 {
+            let g = cjk_weekday(d).unwrap();
+            assert_eq!(g[7], 0, "星期 {d}: 第 8 行应留空（与日期数字同基线）");
+            assert!(g.iter().any(|r| *r != 0), "星期 {d}: 不能是空白");
+        }
+    }
+
+    /// 七天的星期字形都要真的画到 64×32 画面上，而且互不相同。
+    #[test]
+    fn every_weekday_renders_distinctly() {
+        let (w, h) = (64usize, 32usize);
+        let mut seen = std::collections::HashSet::new();
+        for d in 0..7u32 {
+            let mut buf = vec![Color::default(); w * h];
+            let t = LocalTime { hour: 20, min: 36, sec: 0, mday: 26, mon: 9, wday: d };
+            draw_clock(&mut buf, w, h, &t, true, "zh");
+            // 最后 9 行是日期 + 星期；日期 "09-26 " 约 68 点，星期至少再加 8 点
+            let glyph_ink: usize =
+                cjk_weekday(d).unwrap().iter().map(|r| r.count_ones() as usize).sum();
+            let bottom_lit = buf[(h - 9) * w..].iter().filter(|c| c.r > 50).count();
+            assert!(
+                bottom_lit >= glyph_ink + 40,
+                "星期 {d}: 底部日期/星期笔画缺失（只有 {bottom_lit} 点）"
+            );
+            seen.insert(buf.iter().map(|c| c.r).collect::<Vec<u8>>());
+        }
+        assert_eq!(seen.len(), 7, "七天的画面应互不相同");
     }
 }
