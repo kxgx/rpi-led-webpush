@@ -28,7 +28,7 @@ RGB LED 点阵屏。解码与缩放都在浏览器里完成，只通过 WebSocke
 
 ## 2. 当前状态（维护本节，发版/大改后更新）
 
-- 版本：`Cargo.toml` = **0.2.6**；最近 release commit `release: v0.2.6`，annotated tag `v0.2.6`。
+- 版本：`Cargo.toml` = **0.2.7**；最近 release commit `release: v0.2.7`，annotated tag `v0.2.7`。
 - 已实现功能：
   - 投送：视频文件 / 摄像头 / 屏幕共享，适应方式可选；`/view` 实时预览面板画面；
   - 设置页：面板几何、亮度（热更新）、空闲行为、语言、硬件驱动参数、网络 / HTTPS、
