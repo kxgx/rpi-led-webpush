@@ -108,6 +108,7 @@ sudo ./rpi-led-webpush --web-port 0               # 关闭网页服务
 | `--mapping` | `regular` | GPIO 映射（`regular`、`adafruit-hat`、`adafruit-hat-pwm`、`classic` 等） |
 | `--rgb-sequence` | `RGB` | 面板的颜色通道顺序 |
 | `--web-port` | 8080 | `0` 表示关闭网页服务 |
+| `--web-host` | 自动 | 绑定地址；留空 = 开 HTTPS 时 `127.0.0.1`，否则 `0.0.0.0` |
 | `--https` / `--no-https` | 关 | 内置 HTTPS 前端（socat 做 TLS 终止） |
 | `--https-port` | 8443 | HTTPS 端口（`web_port` 仍是内部 HTTP 端口） |
 | `--https-cert` / `--https-key` | 自动 | 证书/私钥 PEM 路径；留空 = `<配置目录>/tls/`（首次自动生成自签名证书） |
@@ -125,8 +126,11 @@ sudo ./rpi-led-webpush --web-port 0               # 关闭网页服务
 `https://<设备>:8443/` 访问，并在浏览器里信任一次证书。
 
 * 依赖 `socat` + `openssl`：`sudo apt install socat openssl`（`.deb` 里是 Recommends，apt 默认会装）
-* `https_port` 默认 8443，也可以设成 443；`web_port` 仍是内部 HTTP 端口，普通 HTTP 照旧可用
-* `https_cert` / `https_key` 可以指向你自己的证书（例如 CA 签发的），留空则用自动生成的自签名证书
+* `https_port` 默认 8443，也可以设成 443；`web_port` 仍是内部 HTTP 端口
+* 开启 HTTPS 后内嵌 HTTP 服务默认只绑定 `127.0.0.1`（由 socat 反代），局域网明文访问默认关闭；
+  确实需要时把 `web_host` 设为 `0.0.0.0`，并确认网络可信
+* `https_cert` / `https_key` 只允许指向 `<配置目录>/tls/` 内（防止网页 API 把证书写到任意文件）；
+  留空则用自动生成的自签名证书
 * 改任何 HTTPS 设置都需要重启（`POST /api/restart` 或设置页的「重启设备」）
 * 想继续用 systemd 管理 443 端口和自有证书，`contrib/rpi-led-webpush-tls.service` 那套外置前端仍然可用
 
@@ -135,6 +139,8 @@ sudo ./rpi-led-webpush --web-port 0               # 关闭网页服务
 * **同一时刻只能有一个程序驱动面板**（RP1 PIO 只有 4 个状态机，多进程会互相破坏）。程序会
   检测可能的冲突并拒绝启动；设 `LED_FORCE=1` 可强制运行。
 * 网页界面**没有任何鉴权** —— 能访问到端口的人都可以投送内容，仅在可信网络中使用。
+  内置加固：变更类请求必须是 `POST` 且带 `X-Led-Webpush: 1` 请求头（CSRF）；WebSocket 握手校验
+  `Origin` 与 `Host` 同源；请求行/请求头/连接数有上限；证书/私钥路径限制在 `<配置目录>/tls/` 内。
 
 ## 许可
 

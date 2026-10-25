@@ -38,8 +38,11 @@ RGB LED 点阵屏。解码与缩放都在浏览器里完成，只通过 WebSocke
     从 `v0.2.3` 开始提供；
   - **配置增量写盘**：网页保存只回写真正变化的键，注释/未知键/顺序/用户写法都保留，
     无变化时不碰文件（§5），从 `v0.2.6` 开始提供；
+  - **Web 安全加固**（`v0.2.7` 起）：变更类请求必须 POST + `X-Led-Webpush: 1`
+    请求头（CSRF），WebSocket 校验 Origin，请求行/头/连接数有上限，加安全响应头，
+    开启 HTTPS 时 HTTP 默认只绑 127.0.0.1，证书/私钥路径限制在 `<配置目录>/tls/`（§8/§12）；
   - deb 打包（arm64）+ tag 触发 CI 自动构建并创建 GitHub Release。
-- 测试规模：**20 个单元测试**（clock 6 / config 8 / tls 4 / web 2），Linux 上 `cargo test` 全绿。
+- 测试规模：**22 个单元测试**（clock 6 / config 8 / tls 4 / web 4），Linux 上 `cargo test` 全绿。
 - 已知未修问题（见 §7）：12 小时制在 64 宽面板会裁字；逻辑宽度 < 46 px 的窄面板会裁掉星期。
 - 未提交改动以 `git status` 为准；本文件若与代码不一致，**以代码为准并顺手修正本文件**。
 
@@ -75,7 +78,7 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 | 文件 | 职责 | 注意 |
 |---|---|---|
 | `src/main.rs` | CLI 解析、面板初始化（FFI options）、主循环（推流帧 → 面板；空闲时钟/呼吸/黑屏）、TLS 前端生命周期、信号处理、多驱动并发检测 `guard()` | 改硬件参数要同步 `ffi.rs` 结构体字段顺序（照抄 C 头文件） |
-| `src/web.rs` | 手写 HTTP/WebSocket/SHA-1/base64；三个内嵌页面；路由与 API；`Mirror`（/view 数据源）、`Stream`（推流帧）、`RuntimeCtl`（热更新控制 + HTTPS 运行状态） | 页面是 raw string；`data-en` 做中英切换；表单 id 必须与 JS 的 `FIELDS`/`CHECKS` 对应 |
+| `src/web.rs` | 手写 HTTP/WebSocket/SHA-1/base64；三个内嵌页面；路由与 API；`Mirror`（/view 数据源）、`Stream`（推流帧）、`RuntimeCtl`（热更新控制 + HTTPS 运行状态）；**安全层**：方法白名单、CSRF 请求头、Origin/Host 校验、请求/连接上限、安全响应头 | 页面是 raw string；`data-en` 做中英切换；表单 id 必须与 JS 的 `FIELDS`/`CHECKS` 对应；改页面里的 fetch 必须带上 `H` 请求头；新增路由必须显式限制方法（§6.1） |
 | `src/config.rs` | `key=value` 配置：默认值、解析、`normalize()`、**增量写盘**（只改变化键，保留注释/未知键）、`restart_eq()` 判定热改/重启、`SharedConfig` | 新增配置项要改**多处**（见 §5、§13） |
 | `src/clock.rs` | 空闲时钟：5×7 ASCII + 8×8 中文星期字模、绘制、blit | 字模规范与结构测试见 §7 |
 | `src/tls.rs` | 内置 HTTPS：参数校验/路径解析、socat/openssl 命令行、证书自动生成、socat 子进程管理 | 程序本身**不做 TLS**（零依赖约束） |
@@ -106,7 +109,7 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 
 - **热更新**（无需重启）：`brightness`、`idle`、`show_clock`、`clock_24h`、`lang`。
 - **需重启**：其余全部——几何（`rows`/`cols`/`chain`/`parallel`）、接线
-  （`mapping`/`rgb_sequence`）、`web_port`、全部 `https_*`、全部硬件驱动参数。
+  （`mapping`/`rgb_sequence`）、`web_port`/`web_host`、全部 `https_*`、全部硬件驱动参数。
   判定逻辑在 `Config::restart_eq()`；`SharedConfig::update()` 返回
   `Applied` / `NeedsRestart` / `SaveFailed`。
 
@@ -126,6 +129,7 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 | `mapping` | regular | 重启 | 硬件 | GPIO 映射：`regular`/`adafruit-hat`/`adafruit-hat-pwm`/`classic`/`compute-module`/`regular-pi1` |
 | `rgb_sequence` | RGB | 重启 | 硬件 | 颜色通道顺序，如 `RBG` |
 | `web_port` | 8080 | 重启 | **网络 / HTTPS** | `0` = 关闭网页服务 |
+| `web_host` | 空 | 重启 | **网络 / HTTPS** | 绑定地址；空 = 自动（HTTPS 开时 `127.0.0.1`，否则 `0.0.0.0`） |
 | `https` | 0 | 重启 | 网络 / HTTPS | 启用内置 HTTPS 前端 |
 | `https_port` | 8443 | 重启 | 网络 / HTTPS | HTTPS 监听端口 |
 | `https_cert` | 空 | 重启 | 网络 / HTTPS | 证书 PEM 路径；空 = `<配置目录>/tls/cert.pem` |
@@ -147,7 +151,8 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 
 **normalize 规则**（`Config::normalize`）：几何/亮度/PWM 等 clamp；`mapping`/
 `rgb_sequence` 空值回落默认；`lang` 非 `en` 一律 `zh`；`https_port == 0` 回落 8443；
-`https_cert`/`https_key` 去首尾空白；`panel_type` 归一化成库认识的大小写。
+`https_cert`/`https_key` 去首尾空白（且 `tls::plan` 还会限制在 `<配置目录>/tls/` 内）；
+`web_host` 去首尾空白，含空白/控制字符时回落到自动；`panel_type` 归一化成库认识的大小写。
 新增键时**必须同步**：结构体字段、`Default`、`parse_line`、`normalize`、
 `write_config`、`pairs()`、`restart_eq`、`config_json`、`api_config_set`、设置页、README、
 `contrib/rpi-led-webpush.conf.example`。
@@ -164,11 +169,19 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 | `/view` | GET | **预览页**（内嵌）：通过 WebSocket 显示面板当前画面 |
 | `/settings` | GET | **设置页**（内嵌）：设备设置（分区见 §6.2） |
 | `/geo` | GET | 逻辑分辨率，纯文本 `64 32` |
-| `/api/config` | GET / POST | 设置 + 运行时信息（JSON）/ 修改设置（表单编码，自动存盘） |
-| `/api/brightness` | GET / POST | 读取亮度 / 设置亮度（`?brightness=1..100`，热更新并落盘） |
-| `/api/restart` | POST | 干净退出，交给 supervisor 重启（改几何/HTTPS 后需要） |
-| `/push` | WS | 浏览器 → 面板：`[宽 u16 LE][高 u16 LE][RGB...]` |
-| `/ws` | WS | 面板 → 浏览器预览：`[宽 u16 LE][高 u16 LE][seq u32 LE][RGB...]` |
+| `/api/config` | GET / POST | 设置 + 运行时信息（JSON）/ 修改设置（表单编码，自动存盘；**仅 POST**，需 CSRF 头，忽略 query） |
+| `/api/brightness` | GET / POST | 读取亮度 / 设置亮度（`?brightness=1..100`，热更新并落盘；**仅 POST**，需 CSRF 头） |
+| `/api/restart` | POST | 干净退出，交给 supervisor 重启（**仅 POST**，需 CSRF 头）；改几何/HTTPS 后需要 |
+| `/push` | WS | 浏览器 → 面板：`[宽 u16 LE][高 u16 LE][RGB...]`；校验 Origin/Upgrade |
+| `/ws` | WS | 面板 → 浏览器预览：`[宽 u16 LE][高 u16 LE][seq u32 LE][RGB...]`；校验 Origin/Upgrade |
+
+**方法/安全约定**：页面与只读接口只接受 `GET`（`HEAD` 不支持，返回 405），变更接口只接受 `POST`；
+变更请求必须带 `X-Led-Webpush: 1` 请求头，且 `Origin`（若有）的主机必须等于 `Host` 的主机；
+WebSocket 握手必须带 `Upgrade: websocket` + `Connection: Upgrade` + `Sec-WebSocket-Version: 13`，
+且 `Origin`（若有）与 `Host` 同源。未知路径返回 404（不再回退到投送页）。请求行/单头 ≤8KB、
+请求头总量 ≤32KB、最多 100 个头、请求体 ≤64KB、并发连接 ≤64，超出分别返回 414/431/413/503。
+所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、
+`Content-Security-Policy: frame-ancestors 'self'`、`Referrer-Policy: no-referrer`、`Cache-Control: no-store`。
 
 **网页没有任何鉴权**，只能在可信网络使用。浏览器只在安全上下文（HTTPS 或 localhost）
 开放摄像头/屏幕采集；文件投送普通 HTTP 即可。
@@ -182,7 +195,7 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 |---|---|---|---|
 | 1 | **面板 / Panel** | `rows` `cols` `chain` `parallel`、`brightness`、`idle`、`show_clock`、`clock_24h`、`lang` | 混合：几何需重启，亮度/空闲/时钟/语言热更新 |
 | 2 | **硬件 / Hardware** | GPIO 映射 `mapping`、颜色顺序 `rgb_sequence` | 需重启 |
-| 3 | **网络 / HTTPS / Network / HTTPS** | `web_port`、`https`、`https_port`、`https_cert`、`https_key` | 需重启 |
+| 3 | **网络 / HTTPS / Network / HTTPS** | `web_port`、`web_host`、`https`、`https_port`、`https_cert`、`https_key` | 需重启 |
 | 4 | **驱动芯片 / 初始化 / Driver / init** | `panel_type` `gpio_slowdown` `pwm_bits` `pwm_lsb_ns` `pwm_dither` `scan_mode` `row_address_type` `multiplexing` `limit_refresh_hz` `rp1_pio` `pixel_mapper` `no_hardware_pulse` `inverse_colors` `no_busy_waiting` | 需重启 |
 | 5 | **状态 / Status** | 只读：面板逻辑分辨率、推流状态、当前亮度、HTTPS 运行状态/端口/错误、配置文件路径 | — |
 
@@ -204,8 +217,10 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 - 中英切换：元素写 `data-en="English"`，Server 端把 `__LANG__` 替换成 `zh`/`en`；
   页面加载后 JS 替换 `data-en` 文本（不写 data-en 的保持中文）。
 - 页面样式统一暗色；canvas 预览用 `image-rendering: pixelated`。
+- 页面里所有变更请求的 `fetch` 必须带 `headers: H`（=`{'X-Led-Webpush': '1'}`），否则 403；
+  新增/修改页面时记得同步（三个页面顶部都定义了 `H`）。
 - 运行时状态要显示到「状态」区：在 `RuntimeCtl` 加字段 → 写进 `config_json()` 的
-  `runtime` 对象 → 设置页 JS 的 `load()` 里渲染。
+  `runtime` 对象 → 设置页 JS 的 `load()` 里渲染（渲染字符串必须经过 `esc()`）。
 
 ---
 
@@ -246,33 +261,38 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 
 启动流程（`https=1` 时）：
 
-1. `tls::plan()` 校验：`web_port > 0`、HTTPS 端口 ≠ web_port、解析证书/私钥路径
-   （空 = `<配置目录>/tls/cert.pem|key.pem`；相对路径按配置目录解析）。
-2. 证书不存在 → 用 `openssl req -x509 -newkey rsa:2048 -nodes -days 3650` 生成自签名
-   证书（CN=rpi-led-webpush，私钥 chmod 600）。
+1. `tls::plan()` 校验：`web_port > 0`、HTTPS 端口 ≠ web_port、证书/私钥路径
+   **必须位于 `<配置目录>/tls/` 下**（词法规范化 + canonicalize 后比对，拒绝目录逃逸、
+   逗号/控制字符）。空 = `<配置目录>/tls/cert.pem|key.pem`。
+2. 证书不存在 → 用 `openssl req -x509 -newkey rsa:2048 -nodes -days 825` 生成自签名
+   证书（CN=rpi-led-webpush + `subjectAltName`（hostname/.local/局域网 IP），
+   私钥 chmod 600，tls 目录 chmod 700）；目标已存在但不是普通文件（符号链接/设备）时拒绝写入。
 3. spawn `socat OPENSSL-LISTEN:<port>,cert=…,key=…,verify=0,reuseaddr,fork TCP:127.0.0.1:<web_port>`。
 4. 等 250 ms 用 `try_wait()` 确认 socat 没立即退出（端口占用/证书读不了会报错）。
 5. 运行期间：`TlsFrontEnd` 在 Drop 里 kill + wait；子进程另设 `PR_SET_PDEATHSIG`，
    主进程崩溃/被 kill 时 socat 一起退出，避免孤儿进程占端口。
 6. 启动失败只影响 HTTPS：打印原因、写入 `RuntimeCtl.https_note`，HTTP 服务继续跑。
 
-配置/CLI：`https`、`https_port`、`https_cert`、`https_key`；
-`--https`、`--no-https`、`--https-port`、`--https-cert`、`--https-key`。修改需重启。
+配置/CLI：`https`、`https_port`、`https_cert`、`https_key`、`web_host`；
+`--https`、`--no-https`、`--https-port`、`--https-cert`、`--https-key`、`--web-host`。修改需重启。
 
 依赖：`socat` + `openssl`（deb 里是 `Recommends`，apt 默认会装；
 `dpkg -i` 需要自己 `apt install socat openssl`）。HTTPS 端口可以设 443（程序本来就是 root）。
 
-已知取舍：启用 HTTPS 后普通 HTTP **仍然监听 0.0.0.0:web_port**（方便旧书签；
-未强制收窄到 loopback）。外置 systemd 方案 `contrib/rpi-led-webpush-tls.service` 仍有效，
-但**不要和内置 HTTPS 同时启用**（会抢端口/出现两个 TLS 前端）。
+已知取舍：**开启 HTTPS 时 `web_host` 留空会自动只绑定 `127.0.0.1`**（socat 反代），
+不再把明文 HTTP 暴露到局域网；确实需要时显式设 `web_host=0.0.0.0`。证据：评测中曾发现
+HTTPS 与 `0.0.0.0:80` 双开，攻击面翻倍。外置 systemd 方案
+`contrib/rpi-led-webpush-tls.service` 仍有效，但**不要和内置 HTTPS 同时启用**
+（会抢端口/出现两个 TLS 前端）。
 
 ---
 
 ## 9. 构建、测试与 Windows 开发机注意事项
 
 - **Linux/Pi**：`cargo build --release` 即可；`build.rs` 自动编 vendored 驱动。
-- **测试**：`cargo test`（20 个）。`web.rs` 的测试会在 `127.0.0.1:0` 起真实 HTTP 服务，
-  需要允许监听本地 TCP；`config.rs`/`web.rs` 测试会写系统临时目录。
+- **测试**：`cargo test`（22 个）。`web.rs` 的测试会在 `127.0.0.1:0` 起真实 HTTP 服务，
+  需要允许监听本地 TCP；`config.rs`/`web.rs` 测试会写系统临时目录。`security_*` 测试覆盖
+  CSRF 头/方法/404/安全头、WS Origin、请求行上限；改协议层务必保持它们全绿。
 - **Windows 开发机无法 `cargo build`**（`build.rs` 需要 `g++` 编 C++，且程序依赖 Linux
   的 `/dev/mem`、`/dev/pio0`、`prctl` 等）。可在 Windows 上做的验证：
   1. **整 crate 类型检查**（不链接）：`rustc --edition 2024 --crate-type bin --emit=metadata src/main.rs -o %TEMP%\m.rmeta`，exit 0 即通过；
@@ -343,14 +363,27 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 ## 12. 安全与注意事项
 
 - 网页/API/WS **完全没有鉴权**：只部署在可信内网；对公网暴露需自行加反代+鉴权。
+- **内置加固**（`v0.2.7` 起）：
+  - 变更接口（`/api/config`、`/api/brightness`、`/api/restart`）只接受 `POST`，并要求
+    `X-Led-Webpush: 1` 请求头；有 `Origin` 时其主机必须等于 `Host` 的主机（防 CSRF/跨源写入）；
+  - 页面/只读接口只接受 `GET`（`HEAD` 405）；未知路径 404；
+  - WebSocket 握手校验 `Upgrade`/`Connection`/`Sec-WebSocket-Version: 13`，有 `Origin` 时必须同源
+    （防跨源推帧/读预览）；
+  - 请求行/单头 ≤8KB、头总量 ≤32KB、≤100 个头、请求体 ≤64KB、并发连接 ≤64，读超时 10s；
+  - 响应带 `nosniff` / `X-Frame-Options: SAMEORIGIN` / `frame-ancestors 'self'` /
+    `Referrer-Policy: no-referrer` / `Cache-Control: no-store`；
+  - 开启 HTTPS 时 `web_host` 留空会自动只绑 `127.0.0.1`；
+  - `https_cert`/`https_key` 只能位于 `<配置目录>/tls/`，生成前检查非符号链接/普通文件。
 - HTTPS 是**自签名证书**：浏览器首次访问需手动信任一次；摄像头/屏幕共享必须走 HTTPS
-  （安全上下文要求）。
+  （安全上下文要求）。证书含 hostname/局域网 IP 的 SAN、有效期 825 天，重新生成时生效。
+- 页面里的 `fetch` 若发变更请求，必须带上页面顶部的 `H`（`X-Led-Webpush: 1`）请求头，
+  否则会被 403；新增变更接口时同步更新 §6.1 的方法约定。
 - 后台保活：桌面浏览器用 Wake Lock + Worker 定时器 + 静音音频三层保活；手机浏览器挂起
   后台页面是平台限制，网页无法绕过。
 - 修改网络/HTTPS/几何/驱动参数后必须重启进程（设置页有提示和「重启设备」按钮）。
 - 加依赖前先想清楚：零 crate 依赖是项目卖点；优先系统工具或手写实现。
 - 改动涉及端口/协议/配置键时，同步更新 README.md、README.zh-CN.md、本文件、
-  `contrib/rpi-led-webpush.conf.example`。
+  `contrib/rpi-led-webpush.conf.example`；涉及安全层时同时更新 §6.1/§8/§12 和 `security_*` 测试。
 
 ---
 
@@ -367,7 +400,8 @@ Windows 开发机无法 `cargo build`，替代验证方法见 §9。
 5. `README.md` / `README.zh-CN.md` / `contrib/rpi-led-webpush.conf.example`；
 6. 补测试（config 解析/落盘、web 的 POST 行为）。
 
-**加一条 HTTP 路由 / 新页面**：`handle_client()` 的 `match path_only` 加分枝；
+**加一条 HTTP 路由 / 新页面**：`handle_client()` 的 `match path_only` 加分枝；必须显式限制
+方法（只读 `GET`、变更 `POST`，其它 405），变更路由要调用 `mutation_allowed()` 校验 CSRF/Origin；
 页面做成 `const XXX_HTML: &str = r#"…"#;` 并用 `html_lang()` 替换 `__LANG__`；
 如需中英切换用 `data-en`；不要引入外部静态资源。
 

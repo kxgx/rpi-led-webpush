@@ -122,6 +122,7 @@ Run it as root: it needs `/dev/mem` and `/dev/pio0`.
 | `--mapping` | `regular` | GPIO mapping (`regular`, `adafruit-hat`, `adafruit-hat-pwm`, `classic`, …) |
 | `--rgb-sequence` | `RGB` | channel order of your panel |
 | `--web-port` | 8080 | `0` disables the web UI |
+| `--web-host` | auto | bind address; empty = `127.0.0.1` when HTTPS is on, else `0.0.0.0` |
 | `--https` / `--no-https` | off | built-in HTTPS front-end (socat TLS termination) |
 | `--https-port` | 8443 | HTTPS listen port (`web_port` stays the internal HTTP port) |
 | `--https-cert` / `--https-key` | auto | PEM cert/key paths; empty = `<config dir>/tls/*` (self-signed, generated on first use) |
@@ -140,10 +141,11 @@ certificate with `openssl` into `<config dir>/tls/` on first use. Then open
 `https://<device>:8443/` and trust the certificate once per browser.
 
 * requires `socat` + `openssl` — `sudo apt install socat openssl` (the `.deb` recommends both)
-* `https_port` defaults to 8443 (443 works too); `web_port` remains the internal HTTP port, so
-  plain HTTP keeps working
-* `https_cert` / `https_key` can point at your own PEM files (e.g. a CA-signed pair); leave them
-  empty to use the auto-generated self-signed certificate
+* `https_port` defaults to 8443 (443 works too); `web_port` remains the internal HTTP port
+* with HTTPS on, the internal HTTP server binds `127.0.0.1` by default and is only reachable
+  through socat. Set `web_host=0.0.0.0` only if you really need plain-HTTP access from your LAN
+* `https_cert` / `https_key` may only point inside `<config dir>/tls/` (prevents the web API from
+  writing certificates over arbitrary files); leave them empty to use the auto-generated cert
 * changing any HTTPS setting needs a restart (`POST /api/restart` or the settings button)
 * if you prefer a systemd-managed TLS front-end on 443 with your own certificate, the external
   `contrib/rpi-led-webpush-tls.service` setup still works
@@ -154,7 +156,10 @@ certificate with `openssl` into `<config dir>/tls/` on first use. Then open
   concurrent drivers corrupt each other). The program detects likely competitors and refuses to
   start; set `LED_FORCE=1` to override.
 * The web UI has **no authentication** — anyone who can reach the port can push content. Use it on
-  a trusted network only.
+  a trusted network only. Built-in hardening: state-changing requests require `POST` plus the
+  `X-Led-Webpush: 1` header (CSRF), WebSocket upgrades are rejected when the `Origin` host differs
+  from `Host`, request/header/connection sizes are capped, and the cert/key paths are confined to
+  `<config dir>/tls/`.
 
 ## Licence
 
