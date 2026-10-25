@@ -52,6 +52,7 @@ Section: utils
 Priority: optional
 Architecture: $ARCH
 Depends: libc6, libstdc++6
+Recommends: socat, openssl
 Maintainer: $MAINTAINER
 Description: $DESC
  Web UI for sending video / camera / screen share to a HUB75 RGB LED

@@ -45,7 +45,7 @@ WebSocket 发过来，所以驱动面板的设备几乎不占 CPU。
 * 路径：`LED_CONFIG` → `/etc/rpi-led-webpush/config` → `./rpi-led-webpush.conf`
 * CLI 参数**只覆盖当次运行**；网页修改的是配置文件。
 * **立即生效**：`brightness`、`idle`、`show_clock`、`clock_24h`、`lang`。
-* **需重启**（`POST /api/restart`）：尺寸 / 连接方式 / `web_port`，以及下列**硬件驱动**参数。
+* **需重启**（`POST /api/restart`）：尺寸 / 连接方式 / `web_port`、HTTPS 相关设置，以及下列**硬件驱动**参数。
 
 无浏览器推流时面板默认显示**时钟 + 日期**（`show_clock=1`，可配 `clock_24h`、`lang=zh|en`）。
 关掉时钟后回到空闲呼吸（`idle=1`）或黑屏（`idle=0`）。
@@ -107,6 +107,9 @@ sudo ./rpi-led-webpush --web-port 0               # 关闭网页服务
 | `--mapping` | `regular` | GPIO 映射（`regular`、`adafruit-hat`、`adafruit-hat-pwm`、`classic` 等） |
 | `--rgb-sequence` | `RGB` | 面板的颜色通道顺序 |
 | `--web-port` | 8080 | `0` 表示关闭网页服务 |
+| `--https` / `--no-https` | 关 | 内置 HTTPS 前端（socat 做 TLS 终止） |
+| `--https-port` | 8443 | HTTPS 端口（`web_port` 仍是内部 HTTP 端口） |
+| `--https-cert` / `--https-key` | 自动 | 证书/私钥 PEM 路径；留空 = `<配置目录>/tls/`（首次自动生成自签名证书） |
 | `--no-idle` | — | 空闲时不显示呼吸灯（黑屏） |
 | `--no-clock` | — | 空闲时不显示时钟/日期 |
 | `--clock-12h` | — | 12 小时制（默认 24 小时制） |
@@ -114,8 +117,17 @@ sudo ./rpi-led-webpush --web-port 0               # 关闭网页服务
 ## HTTPS（摄像头与屏幕共享需要）
 
 浏览器只在**安全上下文**下开放摄像头和屏幕采集接口。用普通 HTTP 打开页面**仍然可以投送
-视频文件**；要用摄像头或共享屏幕，需要在前面加一层 TLS —— `contrib/rpi-led-webpush-tls.service`
-给出了用 `socat` + 自签证书的两行配置，浏览器里接受一次证书警告即可。
+视频文件**。
+
+在**设置页 → HTTPS** 打开开关（或配置 `https=1`）即可：程序用系统 `socat` 在内嵌 HTTP 端口
+前面做 TLS 终止，首次会用 `openssl` 在 `<配置目录>/tls/` 生成一张自签名证书。之后用
+`https://<设备>:8443/` 访问，并在浏览器里信任一次证书。
+
+* 依赖 `socat` + `openssl`：`sudo apt install socat openssl`（`.deb` 里是 Recommends，apt 默认会装）
+* `https_port` 默认 8443，也可以设成 443；`web_port` 仍是内部 HTTP 端口，普通 HTTP 照旧可用
+* `https_cert` / `https_key` 可以指向你自己的证书（例如 CA 签发的），留空则用自动生成的自签名证书
+* 改任何 HTTPS 设置都需要重启（`POST /api/restart` 或设置页的「重启设备」）
+* 想继续用 systemd 管理 443 端口和自有证书，`contrib/rpi-led-webpush-tls.service` 那套外置前端仍然可用
 
 ## 注意事项
 

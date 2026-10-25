@@ -29,6 +29,15 @@ clock_24h=1
 # UI + weekday language: zh or en
 lang=zh
 
+# ---- HTTPS (built-in socat TLS front-end) ----
+# 1 = also serve https://<device>:https_port (needs socat + openssl; restart required).
+# With empty cert/key the program generates a self-signed pair in <config dir>/tls/ on start.
+https=0
+https_port=8443
+# PEM paths; empty = <config dir>/tls/cert.pem and <config dir>/tls/key.pem
+https_cert=
+https_key=
+
 # ---- hardware driver ----
 # Special panel ICs that need a power-on init sequence (empty = generic)
 # panel_type=FM6126A

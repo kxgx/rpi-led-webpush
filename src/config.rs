@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_CONFIG_NAME: &str = "rpi-led-webpush.conf";
+/// 开启 HTTPS 但没显式填端口时用的默认端口。
+pub const DEFAULT_HTTPS_PORT: u16 = 8443;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -26,6 +28,15 @@ pub struct Config {
     pub clock_24h: bool,
     /// 界面与星期语言："zh" / "en"
     pub lang: String,
+    // ---- HTTPS（程序本身不做 TLS，交给系统 socat 做 TLS 终止）----
+    /// 启用内置 HTTPS 前端（socat TLS 终止 → 反代到 127.0.0.1:web_port）
+    pub https: bool,
+    /// HTTPS 监听端口（web_port 仍要可用，作为本机后端）
+    pub https_port: u16,
+    /// 证书 PEM 路径；留空 = <配置文件目录>/tls/cert.pem
+    pub https_cert: String,
+    /// 私钥 PEM 路径；留空 = <配置文件目录>/tls/key.pem
+    pub https_key: String,
     // ---- 硬件驱动（rpi-rgb-led-matrix 初始化参数）----
     /// 驱动芯片 / 面板类型：空 = 通用；FM6126A / FM6127 需要上电初始化序列
     pub panel_type: String,
@@ -72,6 +83,10 @@ impl Default for Config {
             show_clock: true,
             clock_24h: true,
             lang: "zh".to_string(),
+            https: false,
+            https_port: DEFAULT_HTTPS_PORT,
+            https_cert: String::new(),
+            https_key: String::new(),
             panel_type: String::new(),
             gpio_slowdown: 1,
             pwm_bits: 11,
@@ -118,6 +133,11 @@ impl Config {
                     _ => "zh".to_string(),
                 }
             }
+            // HTTPS（socat TLS 前端）
+            "https" => self.https = matches!(v, "1" | "true" | "yes" | "on"),
+            "https_port" => self.https_port = v.parse().unwrap_or(self.https_port),
+            "https_cert" => self.https_cert = v.to_string(),
+            "https_key" => self.https_key = v.to_string(),
             // 硬件驱动
             "panel_type" | "driver" => self.panel_type = v.to_string(),
             "gpio_slowdown" => self.gpio_slowdown = v.parse().unwrap_or(self.gpio_slowdown),
@@ -165,6 +185,12 @@ impl Config {
         if self.lang != "en" {
             self.lang = "zh".to_string();
         }
+        // HTTPS 端口 0 没意义（开关用 https=1），回落到默认端口
+        if self.https_port == 0 {
+            self.https_port = DEFAULT_HTTPS_PORT;
+        }
+        self.https_cert = self.https_cert.trim().to_string();
+        self.https_key = self.https_key.trim().to_string();
         // panel_type 统一成库认识的大小写风格
         self.panel_type = match self.panel_type.trim().to_ascii_lowercase().as_str() {
             "" => String::new(),
@@ -175,8 +201,8 @@ impl Config {
         };
     }
 
-    /// 这些字段改动后必须重开面板（库的初始化选项）。
-    pub fn hardware_eq(&self, other: &Config) -> bool {
+    /// 这些字段改动后必须重启进程（面板初始化选项、网络监听）。
+    pub fn restart_eq(&self, other: &Config) -> bool {
         self.rows == other.rows
             && self.cols == other.cols
             && self.chain == other.chain
@@ -184,6 +210,10 @@ impl Config {
             && self.mapping == other.mapping
             && self.rgb_sequence == other.rgb_sequence
             && self.web_port == other.web_port
+            && self.https == other.https
+            && self.https_port == other.https_port
+            && self.https_cert == other.https_cert
+            && self.https_key == other.https_key
             && self.panel_type == other.panel_type
             && self.gpio_slowdown == other.gpio_slowdown
             && self.pwm_bits == other.pwm_bits
@@ -251,7 +281,7 @@ impl SharedConfig {
         if let Err(e) = write_config(&self.path, &new) {
             return ApplyOutcome::SaveFailed(format!("{}: {e}", self.path.display()));
         }
-        if !old.hardware_eq(&new) {
+        if !old.restart_eq(&new) {
             ApplyOutcome::NeedsRestart
         } else {
             ApplyOutcome::Applied
@@ -281,6 +311,11 @@ fn write_config(path: &Path, c: &Config) -> std::io::Result<()> {
          web_port={}\nidle={}\n\
          show_clock={}\nclock_24h={}\n\
          lang={}\n\
+         \n# ---- HTTPS (socat TLS front-end; needs socat + openssl) ----\n\
+         https={}\n\
+         https_port={}\n\
+         https_cert={}\n\
+         https_key={}\n\
          \n# ---- hardware driver ----\n\
          panel_type={}\n\
          gpio_slowdown={}\n\
@@ -308,6 +343,10 @@ fn write_config(path: &Path, c: &Config) -> std::io::Result<()> {
         if c.show_clock { 1 } else { 0 },
         if c.clock_24h { 1 } else { 0 },
         c.lang,
+        if c.https { 1 } else { 0 },
+        c.https_port,
+        c.https_cert,
+        c.https_key,
         c.panel_type,
         c.gpio_slowdown,
         c.pwm_bits,
@@ -384,11 +423,36 @@ mod tests {
         c.parse_line("mapping=adafruit-hat-pwm");
         c.parse_line("garbage line without equals");
         c.parse_line("brightness=999");
+        c.parse_line("https=1");
+        c.parse_line("https_port=443");
+        c.parse_line("https_cert=/etc/ssl/led/cert.pem");
         c.normalize();
         assert_eq!(c.rows, 64);
         assert!(!c.idle);
         assert_eq!(c.mapping, "adafruit-hat-pwm");
         assert_eq!(c.brightness, 100);
+        assert!(c.https);
+        assert_eq!(c.https_port, 443);
+        assert_eq!(c.https_cert, "/etc/ssl/led/cert.pem");
+    }
+
+    #[test]
+    fn https_fields_parse_and_normalize() {
+        let mut c = Config::default();
+        assert!(!c.https, "HTTPS 默认关闭");
+        assert_eq!(c.https_port, DEFAULT_HTTPS_PORT);
+        assert!(c.https_cert.is_empty());
+        assert!(c.https_key.is_empty());
+
+        c.parse_line("https=true");
+        c.parse_line("https_port=0");
+        c.parse_line("  https_cert = /certs/a.pem  ");
+        c.parse_line("https_key=");
+        c.normalize();
+        assert!(c.https);
+        assert_eq!(c.https_port, DEFAULT_HTTPS_PORT, "端口 0 应回落到默认值");
+        assert_eq!(c.https_cert, "/certs/a.pem", "路径应去除首尾空白");
+        assert!(c.https_key.is_empty());
     }
 
     #[test]
@@ -399,6 +463,10 @@ mod tests {
         c.brightness = 42;
         c.rgb_sequence = "RBG".into();
         c.idle = false;
+        c.https = true;
+        c.https_port = 9443;
+        c.https_cert = "/tmp/panel.crt".into();
+        c.https_key = "/tmp/panel.key".into();
         write_config(&path, &c).unwrap();
         let loaded = load(&path);
         assert_eq!(loaded, c);
@@ -417,6 +485,10 @@ mod tests {
         let mut geo = Config::default();
         geo.cols = 128;
         assert_eq!(sc.update(geo), ApplyOutcome::NeedsRestart);
+        // HTTPS 相关字段也要落盘并触发重启（socat 前端在启动时搭）
+        let mut tls = sc.get();
+        tls.https = true;
+        assert_eq!(sc.update(tls), ApplyOutcome::NeedsRestart);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

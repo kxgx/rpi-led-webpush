@@ -24,6 +24,7 @@
 mod clock;
 mod config;
 mod ffi;
+mod tls;
 mod web;
 
 use std::ffi::CString;
@@ -57,6 +58,11 @@ fn apply_cli(c: &mut config::Config) {
             "--parallel" => if let Some(v) = take_value(&argv, &mut i) { c.parallel = v.parse().unwrap_or(c.parallel) },
             "--brightness" => if let Some(v) = take_value(&argv, &mut i) { c.brightness = v.parse().unwrap_or(c.brightness) },
             "--web-port" => if let Some(v) = take_value(&argv, &mut i) { c.web_port = v.parse().unwrap_or(c.web_port) },
+            "--https" => c.https = true,
+            "--no-https" => c.https = false,
+            "--https-port" => if let Some(v) = take_value(&argv, &mut i) { c.https_port = v.parse().unwrap_or(c.https_port) },
+            "--https-cert" => if let Some(v) = take_value(&argv, &mut i) { c.https_cert = v },
+            "--https-key" => if let Some(v) = take_value(&argv, &mut i) { c.https_key = v },
             "--mapping" => if let Some(v) = take_value(&argv, &mut i) { c.mapping = v },
             "--rgb-sequence" => if let Some(v) = take_value(&argv, &mut i) { c.rgb_sequence = v },
             "--no-idle" => c.idle = false,
@@ -82,7 +88,8 @@ fn apply_cli(c: &mut config::Config) {
                 println!("  panel:  --rows --cols --chain --parallel --brightness --no-idle");
                 println!("          --no-clock --clock-12h");
                 println!("  wiring: --mapping NAME --rgb-sequence RGB");
-                println!("  web:    --web-port 8080");
+                println!("  web:    --web-port 8080 --https --https-port 8443");
+                println!("          --https-cert FILE --https-key FILE   (socat TLS front-end)");
                 println!("  driver: --panel-type TYPE   (FM6126A / FM6127, empty = generic)");
                 println!("          --gpio-slowdown 0..4 --pwm-bits 1..11 --pwm-lsb-ns NS");
                 println!("          --pwm-dither 0..2 --scan-mode 0|1 --row-addr-type 0..4");
@@ -260,6 +267,8 @@ fn main() {
     ctl.show_clock.store(args.show_clock, Ordering::SeqCst);
     ctl.clock_24h.store(args.clock_24h, Ordering::SeqCst);
     ctl.lang_en.store(args.lang == "en", Ordering::SeqCst);
+    ctl.https_enabled.store(args.https, Ordering::SeqCst);
+    ctl.https_port.store(args.https_port as i32, Ordering::SeqCst);
     if args.web_port > 0 {
         web::spawn_web_server(
             args.web_port,
@@ -273,6 +282,29 @@ fn main() {
         println!("sender page : http://<device>:{}/", args.web_port);
         println!("panel preview: http://<device>:{}/view", args.web_port);
         println!("settings page: http://<device>:{}/settings", args.web_port);
+    }
+    // 内置 HTTPS：用系统 socat 做 TLS 终止，反代到本机 HTTP 端口（需要 socat + openssl）。
+    // 前端进程跟随本进程生命周期：Drop 里 kill，PDEATHSIG 兜底崩溃/被 kill 的情况。
+    let mut tls_front: Option<tls::TlsFrontEnd> = None;
+    if args.https {
+        match tls::plan(&args, shared_cfg.path()).and_then(|p| {
+            let port = p.https_port;
+            let cert = p.cert.clone();
+            tls::start(&p).map(|front| (front, port, cert))
+        }) {
+            Ok((front, port, cert)) => {
+                ctl.https_running.store(true, Ordering::SeqCst);
+                println!("https page  : https://<device>:{port}/  (self-signed cert — trust it once)");
+                println!("https cert  : {}", cert.display());
+                tls_front = Some(front);
+            }
+            Err(e) => {
+                eprintln!("HTTPS 已开启但前端未启动：{e}");
+                if let Ok(mut note) = ctl.https_note.lock() {
+                    *note = e;
+                }
+            }
+        }
     }
     println!(
         "panel {}x{} (chain {}, parallel {}) mapping={} rgb-sequence={} brightness={}%",
@@ -374,6 +406,10 @@ fn main() {
     }
 
     stop.store(true, Ordering::SeqCst);
+    if let Some(front) = tls_front.take() {
+        println!("https: 已停止 TLS 前端");
+        drop(front); // Drop 里 kill + wait socat
+    }
     unsafe {
         ffi::led_canvas_clear(canvas);
         let _ = ffi::led_matrix_swap_on_vsync(matrix, canvas);

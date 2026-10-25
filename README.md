@@ -40,7 +40,8 @@ Settings live in a plain `key=value` file (no format library):
 * CLI flags override the file **for that run only**; the web UI edits the file.
 * **Hot-applied** (no restart): `brightness`, `idle`, `show_clock`, `clock_24h`, `lang`.
 * **Need restart** (`POST /api/restart`): geometry (`rows`/`cols`/`chain`/`parallel`),
-  wiring (`mapping`/`rgb_sequence`), `web_port`, and all **hardware driver** options below.
+  wiring (`mapping`/`rgb_sequence`), `web_port`, the HTTPS settings, and all **hardware driver**
+  options below.
 
 While nothing is streaming the panel shows a **clock + date** by default (`show_clock=1`,
 `clock_24h`, `lang=zh|en` weekday). Turn the clock off to fall back to the dim-blue idle
@@ -119,6 +120,9 @@ Run it as root: it needs `/dev/mem` and `/dev/pio0`.
 | `--mapping` | `regular` | GPIO mapping (`regular`, `adafruit-hat`, `adafruit-hat-pwm`, `classic`, …) |
 | `--rgb-sequence` | `RGB` | channel order of your panel |
 | `--web-port` | 8080 | `0` disables the web UI |
+| `--https` / `--no-https` | off | built-in HTTPS front-end (socat TLS termination) |
+| `--https-port` | 8443 | HTTPS listen port (`web_port` stays the internal HTTP port) |
+| `--https-cert` / `--https-key` | auto | PEM cert/key paths; empty = `<config dir>/tls/*` (self-signed, generated on first use) |
 | `--no-idle` | — | keep the panel dark while idle (no breathing) |
 | `--no-clock` | — | do not show clock/date while idle |
 | `--clock-12h` | — | 12-hour clock instead of 24-hour |
@@ -126,9 +130,21 @@ Run it as root: it needs `/dev/mem` and `/dev/pio0`.
 ## HTTPS (needed for camera and screen capture)
 
 Browsers only expose the camera and screen-capture APIs in a **secure context**. Opening the page
-over plain HTTP still works for **video files**. To use the camera or screen sharing, put a TLS
-front-end in front of it — `contrib/rpi-led-webpush-tls.service` shows the two-line `socat` setup with a
-self-signed certificate; accept the certificate warning once in the browser.
+over plain HTTP still works for **video files**.
+
+Enable the built-in TLS front-end in **Settings → HTTPS** (or `https=1`): the program runs the
+system `socat` as a TLS terminator in front of its local HTTP port, and generates a self-signed
+certificate with `openssl` into `<config dir>/tls/` on first use. Then open
+`https://<device>:8443/` and trust the certificate once per browser.
+
+* requires `socat` + `openssl` — `sudo apt install socat openssl` (the `.deb` recommends both)
+* `https_port` defaults to 8443 (443 works too); `web_port` remains the internal HTTP port, so
+  plain HTTP keeps working
+* `https_cert` / `https_key` can point at your own PEM files (e.g. a CA-signed pair); leave them
+  empty to use the auto-generated self-signed certificate
+* changing any HTTPS setting needs a restart (`POST /api/restart` or the settings button)
+* if you prefer a systemd-managed TLS front-end on 443 with your own certificate, the external
+  `contrib/rpi-led-webpush-tls.service` setup still works
 
 ## Notes
 

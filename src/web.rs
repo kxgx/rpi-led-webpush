@@ -50,6 +50,14 @@ pub struct RuntimeCtl {
     pub clock_24h: AtomicBool,
     /// 界面语言：0=zh，1=en
     pub lang_en: AtomicBool,
+    /// HTTPS 已启用（配置里 https=1）
+    pub https_enabled: AtomicBool,
+    /// HTTPS 前端（socat）正在运行
+    pub https_running: AtomicBool,
+    /// HTTPS 监听端口（0 = 未配置）
+    pub https_port: AtomicI32,
+    /// HTTPS 启动失败原因（空 = 正常）
+    pub https_note: Mutex<String>,
 }
 
 pub type SharedRuntime = Arc<RuntimeCtl>;
@@ -62,6 +70,10 @@ pub fn new_runtime(brightness: i32, idle: bool) -> SharedRuntime {
         show_clock: AtomicBool::new(true),
         clock_24h: AtomicBool::new(true),
         lang_en: AtomicBool::new(false),
+        https_enabled: AtomicBool::new(false),
+        https_running: AtomicBool::new(false),
+        https_port: AtomicI32::new(0),
+        https_note: Mutex::new(String::new()),
     })
 }
 
@@ -389,6 +401,8 @@ fn config_json(cfg: &SharedConfig, rt: &SharedRuntime, stream: &SharedStream,
         "brightness":{brightness},"mapping":"{mapping}","rgb_sequence":"{rgb_sequence}",
         "web_port":{web_port},"idle":{idle},
         "show_clock":{show_clock},"clock_24h":{clock_24h},"lang":"{lang}",
+        "https":{https},"https_port":{https_port},
+        "https_cert":"{https_cert}","https_key":"{https_key}",
         "panel_type":"{panel_type}","gpio_slowdown":{gpio_slowdown},
         "pwm_bits":{pwm_bits},"pwm_lsb_ns":{pwm_lsb_ns},"pwm_dither":{pwm_dither},
         "scan_mode":{scan_mode},"row_address_type":{row_addr},"multiplexing":{mux},
@@ -396,7 +410,9 @@ fn config_json(cfg: &SharedConfig, rt: &SharedRuntime, stream: &SharedStream,
         "pixel_mapper":"{pixmap}","limit_refresh_hz":{lim},
         "no_busy_waiting":{nobusy},"rp1_pio":{rp1}}},
         "runtime":{{"panel_width":{gw},"panel_height":{gh},"streaming":{streaming},
-        "brightness_now":{bnow},"config_path":"{cpath}"}}}}"#,
+        "brightness_now":{bnow},"config_path":"{cpath}",
+        "https_enabled":{https_en},"https_running":{https_run},
+        "https_port":{https_p},"https_note":"{https_note}"}}}}"#,
         rows = c.rows,
         cols = c.cols,
         chain = c.chain,
@@ -409,6 +425,10 @@ fn config_json(cfg: &SharedConfig, rt: &SharedRuntime, stream: &SharedStream,
         show_clock = c.show_clock,
         clock_24h = c.clock_24h,
         lang = json_escape(&c.lang),
+        https = c.https,
+        https_port = c.https_port,
+        https_cert = json_escape(&c.https_cert),
+        https_key = json_escape(&c.https_key),
         panel_type = json_escape(&c.panel_type),
         gpio_slowdown = c.gpio_slowdown,
         pwm_bits = c.pwm_bits,
@@ -428,6 +448,11 @@ fn config_json(cfg: &SharedConfig, rt: &SharedRuntime, stream: &SharedStream,
         streaming = streaming,
         bnow = rt.brightness.load(Ordering::Relaxed),
         cpath = json_escape(&cfg.path().display().to_string()),
+        https_en = rt.https_enabled.load(Ordering::Relaxed),
+        https_run = rt.https_running.load(Ordering::Relaxed),
+        https_p = rt.https_port.load(Ordering::Relaxed),
+        https_note =
+            json_escape(&rt.https_note.lock().map(|s| s.clone()).unwrap_or_default()),
     )
 }
 
@@ -487,6 +512,11 @@ fn api_config_set(s: &mut TcpStream, cfg: &SharedConfig, rt: &SharedRuntime,
                     _ => "zh".to_string(),
                 }
             }
+            // HTTPS（socat TLS 前端；改了要重启）
+            "https" => c.https = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+            "https_port" => if let Ok(n) = v.parse() { c.https_port = n },
+            "https_cert" => c.https_cert = v,
+            "https_key" => c.https_key = v,
             // 硬件驱动
             "panel_type" | "driver" => c.panel_type = v,
             "gpio_slowdown" => if let Ok(n) = v.parse() { c.gpio_slowdown = n },
@@ -950,8 +980,26 @@ const SETTINGS_HTML: &str = r#"<!doctype html>
         </select></label>
       <label>RGB 顺序 rgb-sequence<span class="tag">如绿蓝对调填 RBG</span>
         <input id="rgb_sequence" type="text" maxlength="3"></label>
-      <label>网页端口 web-port<span class="tag">0 = 关闭网页</span>
+    </div>
+  </section>
+
+  <section>
+    <h2 data-en="Network / HTTPS">网络 / HTTPS</h2>
+    <div class="grid">
+      <label>网页端口 web-port<span class="tag" data-en="0 = no web UI">0 = 关闭网页</span>
         <input id="web_port" type="number" min="0" max="65535"></label>
+      <label class="check"><input id="https" type="checkbox"> <span data-en="Enable HTTPS">启用 HTTPS</span></label>
+      <label>HTTPS 端口<span class="tag" data-en="default 8443">默认 8443</span>
+        <input id="https_port" type="number" min="1" max="65535"></label>
+      <label>证书 cert<span class="tag" data-en="empty = config dir /tls/cert.pem">留空 = 配置目录/tls/cert.pem</span>
+        <input id="https_cert" type="text" placeholder="留空 = 自动生成"></label>
+      <label>私钥 key<span class="tag" data-en="empty = config dir /tls/key.pem">留空 = 配置目录/tls/key.pem</span>
+        <input id="https_key" type="text" placeholder="留空 = 自动生成"></label>
+    </div>
+    <div class="hint" style="color:#6e7681;font-size:12px;margin-top:10px"
+         data-en="Needs a restart. HTTPS uses the system socat as a TLS terminator (install socat + openssl) and generates a self-signed certificate on first use; plain HTTP on web_port keeps working.">
+      本组改完需重启设备。开启 HTTPS 后程序用系统 socat 做 TLS 终止（需要 socat + openssl），首次自动生成自签名证书；
+      之后改用 https://&lt;设备&gt;:端口/ 访问并信任一次证书（摄像头/屏幕共享必须 HTTPS）。原 HTTP 端口仍然可用。
     </div>
   </section>
 
@@ -1019,10 +1067,16 @@ if (L === 'en') {
 }
 const FIELDS = [
   'rows','cols','chain','parallel','brightness','mapping','rgb_sequence','web_port','lang',
+  'https_port','https_cert','https_key',
   'panel_type','gpio_slowdown','pwm_bits','pwm_lsb_ns','pwm_dither','scan_mode',
   'row_address_type','multiplexing','limit_refresh_hz','rp1_pio','pixel_mapper'
 ];
-const CHECKS = ['idle','show_clock','clock_24h','no_hardware_pulse','inverse_colors','no_busy_waiting'];
+const CHECKS = ['idle','show_clock','clock_24h','no_hardware_pulse','inverse_colors','no_busy_waiting','https'];
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
 
 function setStatus(msg, cls) {
   const el = $('st');
@@ -1079,6 +1133,13 @@ async function load() {
       ' <span class="pill' + (rt.streaming ? ' on' : '') + '">' +
       (rt.streaming ? '推流中' : '空闲') + '</span></div>' +
       '<div>当前亮度 <b>' + rt.brightness_now + '%</b></div>' +
+      '<div>HTTPS <b>' +
+        (rt.https_running
+          ? '运行中 · https://' + location.hostname + ':' + rt.https_port + '/'
+          : (rt.https_enabled ? '已启用但未运行（看设备日志）' : '未启用')) +
+        '</b>' +
+        (rt.https_note ? ' <span class="status err">' + esc(rt.https_note) + '</span>' : '') +
+      '</div>' +
       '<div>配置文件 <b>' + rt.config_path + '</b></div>';
   } catch (e) {
     setStatus('读取失败：' + e, 'err');
@@ -1098,8 +1159,8 @@ async function save() {
     });
     const j = await r.json();
     if (j.restart_required) {
-      setStatus(L==='en' ? 'Saved. Hardware/geometry changed — restart the device.'
-                         : '已保存。硬件/几何参数已改，需重启设备生效。', 'warn');
+      setStatus(L==='en' ? 'Saved. Hardware/network changed — restart the device.'
+                         : '已保存。硬件/网络参数已改，需重启设备生效。', 'warn');
     } else {
       setStatus(L==='en' ? 'Saved and applied.' : '已保存并生效。', 'ok');
     }
@@ -1560,7 +1621,7 @@ document.getElementById('file').onchange = (e) => {
 document.getElementById('cam').onclick = async () => {
   if (!window.isSecureContext) {
     alert('浏览器只允许安全上下文（HTTPS 或 localhost）访问摄像头。\n' +
-          '用本机打开可用 localhost；从别的设备访问需要 HTTPS。\n' +
+          '用本机打开可用 localhost；从别的设备访问可在设置页开启 HTTPS。\n' +
           '也可以先用「选择视频文件」投送，它不需要任何权限。');
     return;
   }
@@ -1582,7 +1643,7 @@ document.getElementById('cam').onclick = async () => {
 };
 document.getElementById('screen').onclick = async () => {
   if (!window.isSecureContext) {
-    alert('屏幕共享需要安全上下文（HTTPS 或 localhost）。');
+    alert('屏幕共享需要安全上下文（HTTPS 或 localhost）；从别的设备访问可在设置页开启 HTTPS。');
     return;
   }
   try {
