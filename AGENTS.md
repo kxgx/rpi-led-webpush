@@ -28,14 +28,14 @@ RGB LED 点阵屏。解码与缩放都在浏览器里完成，只通过 WebSocke
 
 ## 2. 当前状态（维护本节，发版/大改后更新）
 
-- 版本：`Cargo.toml` = **0.2.2**；最近 release commit `release: v0.2.2`，annotated tag `v0.2.2`。
+- 版本：`Cargo.toml` = **0.2.3**；最近 release commit `release: v0.2.3`，annotated tag `v0.2.3`。
 - 已实现功能：
   - 投送：视频文件 / 摄像头 / 屏幕共享，适应方式可选；`/view` 实时预览面板画面；
   - 设置页：面板几何、亮度（热更新）、空闲行为、语言、硬件驱动参数、网络 / HTTPS、
     状态面板；
   - 空闲显示：时钟 + 日期 + 星期（中/英）、空闲呼吸、全黑；
   - **内置 HTTPS 开关**：用系统 `socat` 做 TLS 终止 + `openssl` 首启自签证书（见 §8），
-    这是 `v0.2.2` 之后新增、可能尚未发版；
+    从 `v0.2.3` 开始提供；
   - deb 打包（arm64）+ tag 触发 CI 自动构建并创建 GitHub Release。
 - 测试规模：**16 个单元测试**（clock 6 / config 4 / tls 4 / web 2），Linux 上 `cargo test` 全绿。
 - 已知未修问题（见 §7）：12 小时制在 64 宽面板会裁字；逻辑宽度 < 46 px 的窄面板会裁掉星期。
