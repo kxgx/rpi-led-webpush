@@ -278,7 +278,8 @@ impl SharedConfig {
             (old, g.clone())
         };
         new.normalize();
-        if let Err(e) = write_config(&self.path, &new) {
+        // 增量写盘：只改 old→new 之间真正变化的键，保留用户文件的注释/未知键/顺序/写法
+        if let Err(e) = write_config_patch(&self.path, &old, &new) {
             return ApplyOutcome::SaveFailed(format!("{}: {e}", self.path.display()));
         }
         if !old.restart_eq(&new) {
@@ -299,11 +300,6 @@ impl SharedConfig {
 
 /// 原子写入：先写同目录临时文件再 rename，避免半截文件。
 fn write_config(path: &Path, c: &Config) -> std::io::Result<()> {
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
-        _ => std::env::current_dir()?,
-    };
-    fs::create_dir_all(&dir)?;
     let body = format!(
         "# rpi-led-webpush configuration\n\
          rows={}\ncols={}\nchain={}\nparallel={}\n\
@@ -362,13 +358,150 @@ fn write_config(path: &Path, c: &Config) -> std::io::Result<()> {
         if c.no_busy_waiting { 1 } else { 0 },
         c.rp1_pio,
     );
+    atomic_write(path, &body)
+}
+
+impl Config {
+    /// 规范化的 `key=value` 序列（顺序固定）。完整写入与增量 diff 都以它为准，
+    /// 新增配置项时**务必同时加进这里**，否则增量写盘不会覆盖该键。
+    fn pairs(&self) -> Vec<(&'static str, String)> {
+        fn b(v: bool) -> &'static str {
+            if v { "1" } else { "0" }
+        }
+        vec![
+            ("rows", self.rows.to_string()),
+            ("cols", self.cols.to_string()),
+            ("chain", self.chain.to_string()),
+            ("parallel", self.parallel.to_string()),
+            ("brightness", self.brightness.to_string()),
+            ("mapping", self.mapping.clone()),
+            ("rgb_sequence", self.rgb_sequence.clone()),
+            ("web_port", self.web_port.to_string()),
+            ("idle", b(self.idle).to_string()),
+            ("show_clock", b(self.show_clock).to_string()),
+            ("clock_24h", b(self.clock_24h).to_string()),
+            ("lang", self.lang.clone()),
+            ("https", b(self.https).to_string()),
+            ("https_port", self.https_port.to_string()),
+            ("https_cert", self.https_cert.clone()),
+            ("https_key", self.https_key.clone()),
+            ("panel_type", self.panel_type.clone()),
+            ("gpio_slowdown", self.gpio_slowdown.to_string()),
+            ("pwm_bits", self.pwm_bits.to_string()),
+            ("pwm_lsb_ns", self.pwm_lsb_ns.to_string()),
+            ("pwm_dither", self.pwm_dither.to_string()),
+            ("scan_mode", self.scan_mode.to_string()),
+            ("row_address_type", self.row_address_type.to_string()),
+            ("multiplexing", self.multiplexing.to_string()),
+            ("no_hardware_pulse", b(self.no_hardware_pulse).to_string()),
+            ("inverse_colors", b(self.inverse_colors).to_string()),
+            ("pixel_mapper", self.pixel_mapper.clone()),
+            ("limit_refresh_hz", self.limit_refresh_hz.to_string()),
+            ("no_busy_waiting", b(self.no_busy_waiting).to_string()),
+            ("rp1_pio", self.rp1_pio.to_string()),
+        ]
+    }
+}
+
+/// old → new 之间真正变化的键（按规范顺序，便于写文件）。
+fn diff_pairs(old: &Config, new: &Config) -> Vec<(&'static str, String)> {
+    new.pairs()
+        .into_iter()
+        .zip(old.pairs())
+        .filter_map(|((k, v), (old_k, old_v))| {
+            debug_assert_eq!(k, old_k);
+            if v != old_v { Some((k, v)) } else { None }
+        })
+        .collect()
+}
+
+/// 从配置行里取出 key（跳过注释、空行、没有等号的行）。
+fn line_key(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return None;
+    }
+    let (k, _) = t.split_once('=')?;
+    let k = k.trim();
+    if k.is_empty() { None } else { Some(k) }
+}
+
+/// 行尾注释（`key=value  # comment` 里的 `# comment`），替换值时保留它。
+fn line_comment(line: &str) -> Option<&str> {
+    let eq = line.find('=')?;
+    let hash = line.find('#')?;
+    if hash > eq { Some(line[hash..].trim_end()) } else { None }
+}
+
+/// 增量写盘：只改 `old → new` 之间**真正变化**的键。
+///
+/// 文件里的注释、未知键、键顺序和用户写法都原样保留（例如用户写的 `idle=true`
+/// 不会被改写成 `idle=1`，因为该值没变化）；没有变化时完全不碰文件。
+/// 文件不存在（首次运行）时才用带分区注释的完整模板生成。
+fn write_config_patch(path: &Path, old: &Config, new: &Config) -> std::io::Result<()> {
+    let mut pending = diff_pairs(old, new);
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if !path.is_file() {
+        return write_config(path, new);
+    }
+
+    let content = fs::read_to_string(path)?;
+    let eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = content
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .collect();
+    if lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+
+    // 每个变化键替换文件里**最后一次**出现的行（load 的语义是后面的值覆盖前面的）；
+    // 文件里没有的键先留着，最后统一追加。
+    pending.retain(|(key, value)| {
+        let Some(pos) = lines.iter().rposition(|l| line_key(l) == Some(*key)) else {
+            return true;
+        };
+        // 保留该行原有的行尾注释，例如 `brightness=40  # 我调的`
+        lines[pos] = match line_comment(&lines[pos]) {
+            Some(comment) => format!("{key}={value}  {comment}"),
+            None => format!("{key}={value}"),
+        };
+        false
+    });
+
+    if !pending.is_empty() {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("# added by rpi-led-webpush".to_string());
+        for (key, value) in pending {
+            lines.push(format!("{key}={value}"));
+        }
+    }
+
+    let mut body = lines.join(eol);
+    body.push_str(eol);
+    atomic_write(path, &body)
+}
+
+/// 原子写入：先写同目录临时文件再 rename，避免半截文件；已有文件时沿用其权限。
+fn atomic_write(path: &Path, body: &str) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::env::current_dir()?,
+    };
+    fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!(
         ".{}.tmp",
         path.file_name().and_then(|s| s.to_str()).unwrap_or("cfg")
     ));
-    fs::write(&tmp, &body)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    fs::write(&tmp, body)?;
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+    }
+    fs::rename(&tmp, path)
 }
 
 /// 解析配置路径：`LED_CONFIG` → `/etc/rpi-led-webpush/config` → `./rpi-led-webpush.conf`
@@ -489,6 +622,131 @@ mod tests {
         let mut tls = sc.get();
         tls.https = true;
         assert_eq!(sc.update(tls), ApplyOutcome::NeedsRestart);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `pairs()` 是完整写入与增量 diff 的唯一数据源：每个键都必须出现在完整写入的文件里。
+    #[test]
+    fn canonical_pairs_match_file_writer() {
+        let dir = std::env::temp_dir().join(format!("lpwp-test-pairs-{}", std::process::id()));
+        let path = dir.join("c.conf");
+        let mut c = Config::default();
+        c.rows = 64;
+        c.cols = 128;
+        c.mapping = "adafruit-hat".into();
+        c.brightness = 33;
+        c.lang = "en".into();
+        c.idle = false;
+        c.https = true;
+        c.https_port = 443;
+        c.https_cert = "/c/cert.pem".into();
+        c.panel_type = "FM6126A".into();
+        c.pixel_mapper = "Rotate:90".into();
+        write_config(&path, &c).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (key, value) in c.pairs() {
+            let want = format!("{key}={value}");
+            assert!(
+                text.lines().any(|l| l.trim() == want),
+                "完整写入缺少键值 {want}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 增量更新：只改变化的键，保留注释、未知键、顺序、用户写法（不改写未变化的键）。
+    #[test]
+    fn incremental_update_preserves_user_file() {
+        let dir = std::env::temp_dir().join(format!("lpwp-test-inc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.conf");
+        let original = "# my custom comment\n\
+                        rows=32\n\
+                        cols=64\n\
+                        # brightness comment\n\
+                        brightness = 40  # 手动改过\n\
+                        my_future_key=hello\n\
+                        idle=true\n";
+        std::fs::write(&path, original).unwrap();
+
+        let sc = SharedConfig::open_at(path.clone());
+        let mut c = sc.get();
+        c.brightness = 80;
+        assert_eq!(sc.update(c), ApplyOutcome::Applied);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my custom comment"), "注释被破坏: {text}");
+        assert!(text.contains("# brightness comment"), "注释被破坏: {text}");
+        assert!(text.contains("my_future_key=hello"), "未知键被删: {text}");
+        assert!(text.contains("brightness=80"), "变化值没写回: {text}");
+        assert!(!text.contains("brightness = 40"), "旧值残留: {text}");
+        // 变化行的行尾注释也要保留
+        assert!(text.contains("# 手动改过"), "行尾注释被删: {text}");
+        // 未变化的键保持用户写法（不做规范化重写）
+        assert!(text.contains("idle=true"), "未变化的键被改写: {text}");
+        // 顺序保留：注释仍紧挨在 brightness 行上方
+        let lines: Vec<&str> = text.lines().collect();
+        let pos = lines.iter().position(|l| l.starts_with("brightness=")).unwrap();
+        assert_eq!(lines[pos - 1], "# brightness comment", "行顺序被改: {text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件里没有的新键会追加；再次保存（无变化）不会重复追加、也不动文件。
+    #[test]
+    fn incremental_update_appends_missing_keys_once() {
+        let dir = std::env::temp_dir().join(format!("lpwp-test-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.conf");
+        std::fs::write(&path, "rows=32\ncustom=1\n").unwrap();
+
+        let sc = SharedConfig::open_at(path.clone());
+        let mut c = sc.get();
+        c.https = true;
+        c.https_port = 9443;
+        assert_eq!(sc.update(c), ApplyOutcome::NeedsRestart);
+
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.starts_with("rows=32\ncustom=1\n"), "原有行被破坏: {first}");
+        assert!(first.contains("# added by rpi-led-webpush"), "{first}");
+        assert!(first.contains("https=1"), "{first}");
+        assert!(first.contains("https_port=9443"), "{first}");
+
+        // 无变化再保存：文件必须逐字节不变（不重复追加）
+        let same = sc.get();
+        assert_eq!(sc.update(same), ApplyOutcome::Applied);
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first, second, "无变化时不应重写文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没有变化的保存完全不碰文件；CRLF 文件保持 CRLF。
+    #[test]
+    fn incremental_update_is_noop_and_keeps_line_endings() {
+        let dir = std::env::temp_dir().join(format!("lpwp-test-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.conf");
+        let original = "# keep me\r\nrows=32\r\nbrightness=50\r\n";
+        std::fs::write(&path, original).unwrap();
+
+        let sc = SharedConfig::open_at(path.clone());
+        // 无变化保存
+        assert_eq!(sc.update(sc.get()), ApplyOutcome::Applied);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // 有变化时保持 CRLF
+        let mut c = sc.get();
+        c.brightness = 70;
+        sc.update(c);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me\r\n"));
+        assert!(text.contains("brightness=70\r\n"));
+        assert!(!text.replace("\r\n", "").contains('\n'), "出现混合行尾: {text:?}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

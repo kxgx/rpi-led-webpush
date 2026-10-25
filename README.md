@@ -38,6 +38,8 @@ Settings live in a plain `key=value` file (no format library):
 
 * `LED_CONFIG` if set, else `/etc/rpi-led-webpush/config`, else `./rpi-led-webpush.conf`
 * CLI flags override the file **for that run only**; the web UI edits the file.
+* Saving from the web UI is **incremental**: only the keys that actually changed are
+  rewritten — comments, unknown keys and key order in your file are preserved.
 * **Hot-applied** (no restart): `brightness`, `idle`, `show_clock`, `clock_24h`, `lang`.
 * **Need restart** (`POST /api/restart`): geometry (`rows`/`cols`/`chain`/`parallel`),
   wiring (`mapping`/`rgb_sequence`), `web_port`, the HTTPS settings, and all **hardware driver**
