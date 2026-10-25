@@ -168,17 +168,53 @@ jobs:
     steps:
       - name: 校验结果
         run: |
-          FAIL=0
-          for r in ${{ needs.deb-arm64.result }}; do
-            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then FAIL=1; fi
-          done
-          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY_EOF
-          ## deb 构建摘要
+          CHECKS="${{ needs.checks.result }}"
+          DEB="${{ needs.deb-arm64.result }}"
 
-          | 项目 | 结果 |
-          |------|------|
-          | 变更检测 | ${{ needs.checks.result }} |
-          | ARM64 deb | ${{ needs.deb-arm64.result }} |
-          SUMMARY_EOF
-          if [ "$FAIL" = "1" ]; then echo "❌ 存在失败平台"; exit 1; fi
+          # 把 job 结果映射成直观图标（GitHub Step Summary 支持 Markdown/emoji）
+          icon() {
+            case "$1" in
+              success)   echo "✅ 通过" ;;
+              failure)   echo "❌ 失败" ;;
+              cancelled) echo "⚪ 取消" ;;
+              skipped)   echo "⏭️ 跳过" ;;
+              *)         echo "❓ $1" ;;
+            esac
+          }
+
+          FAIL=0
+          # checks 必须成功；deb-arm64 必须成功，或（没代码变更时）允许跳过
+          [ "$CHECKS" = "success" ] || FAIL=1
+          case "$DEB" in
+            success|skipped) ;;
+            *) FAIL=1 ;;
+          esac
+
+          if [ "$FAIL" = "1" ]; then
+            {
+              echo "## ❌ 门禁失败"
+              echo ""
+              echo "| 检查项 | 结果 |"
+              echo "|---|---|"
+              echo "| 变更检测 checks | $(icon "$CHECKS") |"
+              echo "| ARM64 deb 构建 | $(icon "$DEB") |"
+              echo ""
+              echo "> 门禁未通过：请展开失败的 job 查看日志。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::❌ 门禁失败（checks: $(icon "$CHECKS") / deb-arm64: $(icon "$DEB")）"
+            exit 1
+          fi
+
+          {
+            echo "## ✅ 门禁通过"
+            echo ""
+            echo "| 检查项 | 结果 |"
+            echo "|---|---|"
+            echo "| 变更检测 checks | $(icon "$CHECKS") |"
+            echo "| ARM64 deb 构建 | $(icon "$DEB") |"
+            if [ "$DEB" = "skipped" ]; then
+              echo ""
+              echo "> ⏭️ 仅文档变更，已跳过 deb 构建。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
           echo "✅ 门禁通过"
