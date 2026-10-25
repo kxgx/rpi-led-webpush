@@ -27,7 +27,7 @@ jobs:
     outputs:
       code: ${{ steps.codechange.outputs.code }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: 检测代码变更（仅文档变更时跳过；打包脚本/工作流变更也会构建）
@@ -62,6 +62,18 @@ jobs:
           test -x deploy/build-deb.sh
           CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           echo "Cargo.toml version=$CARGO_VER"
+          # tag 构建：tag 版本必须等于 Cargo.toml 版本（vX.Y.Z ↔ version = "X.Y.Z"）。
+          # 忘改 Cargo.toml 就打包会让 deb 版本和 Release/tag 对不上。
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              TAG_VER="${GITHUB_REF_NAME#v}"
+              if [ "$TAG_VER" != "$CARGO_VER" ]; then
+                echo "FAIL: tag $GITHUB_REF_NAME 与 Cargo.toml version $CARGO_VER 不一致"
+                exit 1
+              fi
+              echo "tag/Cargo.toml 版本一致: $TAG_VER"
+              ;;
+          esac
           # 脚本必须使用 dpkg-deb（参考 remilia_pet_qt 约束）
           grep -q 'dpkg-deb --build' deploy/build-deb.sh
           # 服务安装到 lib/systemd/system
@@ -77,7 +89,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: 安装构建工具
         run: |
           sudo apt-get update
@@ -87,8 +99,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: 构建 .deb
         run: deploy/build-deb.sh dist
+      - name: 校验 deb 产物版本
+        run: |
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          ls -la dist
+          if ! ls dist/rpi-led-webpush_${CARGO_VER}_*.deb >/dev/null 2>&1; then
+            echo "FAIL: 没找到 rpi-led-webpush_${CARGO_VER}_*.deb，产物版本与 Cargo.toml 不一致"
+            exit 1
+          fi
+          echo "deb 产物版本: $CARGO_VER"
       - name: 上传构件
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: rpi-led-webpush-linux-arm64-deb
           path: dist/*.deb
@@ -105,10 +126,10 @@ jobs:
       contents: write
       actions: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: rpi-led-webpush-**
           merge-multiple: true
@@ -117,7 +138,7 @@ jobs:
       - name: 生成校验和与变更摘要
         run: |
           echo "Build: ${{ github.ref_name }}" > sums.txt
-          # 包名形如 rpi-led-webpush_0.2.0_arm64.deb（下划线），不能用 rpi-led-webpush-*.deb
+          # 包名形如 rpi-led-webpush_<version>_arm64.deb（下划线），不能用 rpi-led-webpush-*.deb
           shopt -s nullglob
           DEBS=(*.deb)
           if [ ${#DEBS[@]} -eq 0 ]; then
